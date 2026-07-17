@@ -46,6 +46,134 @@ def match_interests(title: str, keywords: list) -> list:
     return [k for k in keywords if k in title]
 
 
+# ---------- 2단계: 동일보도 묶기·분류 ----------
+
+GROUP_THRESHOLD = 0.60  # 정규화 제목 SequenceMatcher 비율 (실데이터 보정값)
+
+
+def normalize_title(title: str) -> str:
+    """묶음 판정용 제목 정규화: 영숫자·한글만 남긴다."""
+    return re.sub(r"[^0-9a-zA-Z가-힣]", "", title).lower()
+
+
+def title_similarity(a: str, b: str) -> float:
+    import difflib
+    return difflib.SequenceMatcher(None, normalize_title(a), normalize_title(b)).ratio()
+
+
+# 기사 성격 규칙 — 위에서부터 첫 일치 적용 (계획서 Ⅳ-4장 7유형)
+OTHER_REGIONS = ["서울", "부산", "대구", "광주", "대전", "울산", "세종", "경기", "강원",
+                 "충북", "충남", "전북", "전남", "경북", "경남", "제주"]
+TYPE_RULES = [
+    ("인터뷰·기획", ["인터뷰", "[기획", "특집", "대담", "기고"]),
+    ("비판·점검", ["질타", "지적", "논란", "반발", "촉구", "감사", "의혹", "수사", "사고",
+                "부실", "비판", "규탄", "삭감", "미흡", "험로", "민원"]),
+    ("정책·현안", ["공약", "법 개정", "법안", "조례", "정책", "제도", "개정", "대책",
+                "실천계획", "기본계획", "방안", "개편"]),
+    ("행사·모집", ["모집", "개최", "캠프", "연수", "특강", "설명회", "공모전", "행사",
+                "축제", "체험", "교실", "성료", "워크숍"]),
+    ("사업·성과", ["협약", "수상", "선정", "성과", "지원", "확대", "구축", "개교", "준공",
+                "출원", "수주", "운영"]),
+]
+
+
+def classify_type(title: str) -> str:
+    if "인천" not in title and ("교육청" in title or "교육감" in title):
+        if any(r in title for r in OTHER_REGIONS):
+            return "타 시도 동향"
+    for type_name, keywords in TYPE_RULES:
+        if any(k in title for k in keywords):
+            return type_name
+    return "기타"
+
+
+# 교육 분야 규칙 — 복수 태그 (계획서 Ⅳ-5장 14분야)
+FIELD_RULES = [
+    ("교권·교원정책", ["교권", "교원", "교사", "아동학대", "교육활동 보호", "교장", "교감"]),
+    ("학생안전·생활교육", ["안전", "학교폭력", "생활교육", "재해", "폭염", "호우", "흡연", "중독"]),
+    ("진로·직업교육", ["진로", "직업", "취업", "도제", "직업계고"]),
+    ("AI·디지털교육", ["AI", "인공지능", "디지털", "코딩", "에듀테크", "플랫폼", "미디어"]),
+    ("교육과정", ["교육과정", "수업", "학력", "성취기준", "논·서술형", "평가"]),
+    ("늘봄·돌봄", ["늘봄", "돌봄", "방과후"]),
+    ("특수교육", ["특수", "장애"]),
+    ("다문화·국제교육", ["다문화", "국제", "재외동포", "이주배경", "글로벌", "외국어", "고려인"]),
+    ("체험교육·학생자치", ["체험", "캠프", "수련", "학생자치", "리더십", "학생회", "수학여행"]),
+    ("예산·시설·감사", ["예산", "시설", "감사", "신설", "청사", "개축", "결산", "추경", "이전"]),
+    ("도서관·평생교육", ["도서관", "평생교육", "평생학습", "독서"]),
+    ("교육행정", ["인사", "조직", "채용", "임용", "적극행정", "개청"]),
+    ("교육복지", ["급식", "복지", "조식", "장학", "결식"]),
+]
+
+
+def classify_fields(title: str) -> list:
+    fields = [name for name, keywords in FIELD_RULES if any(k in title for k in keywords)]
+    return fields or ["기타"]
+
+
+def build_groups(conn, batch_date: str) -> int:
+    """같은 날짜 기사 중 유사 제목을 묶어 article_groups에 저장. 재실행 시 해당 날짜 그룹 재생성.
+
+    반환: 생성된 그룹(2건 이상 묶음) 수. 단독 기사는 그룹을 만들지 않는다.
+    """
+    # 멱등성: 이 날짜 기사가 속한 기존 그룹 제거 후 재생성
+    old = [r[0] for r in conn.execute(
+        "SELECT DISTINCT i.group_id FROM article_group_items i "
+        "JOIN articles a ON a.article_id = i.article_id WHERE a.batch_date = ?",
+        (batch_date,)).fetchall()]
+    if old:
+        marks = ",".join("?" * len(old))
+        conn.execute(f"DELETE FROM article_group_items WHERE group_id IN ({marks})", old)
+        conn.execute(f"DELETE FROM article_groups WHERE group_id IN ({marks})", old)
+
+    rows = conn.execute(
+        "SELECT article_id, title, published_at, input_order FROM articles "
+        "WHERE batch_date = ? ORDER BY article_id", (batch_date,)).fetchall()
+
+    # union-find로 유사 쌍 병합
+    parent = {r["article_id"]: r["article_id"] for r in rows}
+
+    def find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    norm = {r["article_id"]: normalize_title(r["title"]) for r in rows}
+    import difflib
+    for i in range(len(rows)):
+        for j in range(i + 1, len(rows)):
+            a, b = rows[i], rows[j]
+            ratio = difflib.SequenceMatcher(None, norm[a["article_id"]], norm[b["article_id"]]).ratio()
+            if ratio >= GROUP_THRESHOLD:
+                parent[find(a["article_id"])] = find(b["article_id"])
+
+    clusters = {}
+    for r in rows:
+        clusters.setdefault(find(r["article_id"]), []).append(r)
+
+    made = 0
+    for members in clusters.values():
+        if len(members) < 2:
+            continue
+        # 대표기사: 발행시각 빠른 기사 (없으면 입력 순서)
+        rep = min(members, key=lambda r: (r["published_at"] or "9999", r["input_order"]))
+        cur = conn.execute(
+            "INSERT INTO article_groups(group_title, summary, category, article_type, priority, "
+            "representative_article_id, created_at, updated_at) VALUES (?, '', ?, ?, 0, ?, ?, ?)",
+            (rep["title"], ",".join(classify_fields(rep["title"])), classify_type(rep["title"]),
+             rep["article_id"], _now(), _now()))
+        gid = cur.lastrowid
+        for m in members:
+            conn.execute(
+                "INSERT OR IGNORE INTO article_group_items(group_id, article_id, similarity_type, similarity_score) "
+                "VALUES (?, ?, 'title', ?)",
+                (gid, m["article_id"],
+                 title_similarity(rep["title"], m["title"])))
+        made += 1
+    conn.commit()
+    return made
+
+
 def _header_to_batch(m: re.Match):
     batch_date = f"{m.group(1)}-{int(m.group(2)):02d}-{int(m.group(3)):02d}"
     subject = m.group(4)
@@ -219,6 +347,13 @@ def open_db(db_path: str = None) -> sqlite3.Connection:
     conn = sqlite3.connect(str(path))
     conn.row_factory = sqlite3.Row
     conn.executescript(SCHEMA)
+    # 마이그레이션: 2단계 분류 컬럼 (기존 DB 호환)
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(articles)")}
+    if "article_type" not in cols:
+        conn.execute("ALTER TABLE articles ADD COLUMN article_type TEXT DEFAULT ''")
+    if "edu_fields" not in cols:
+        conn.execute("ALTER TABLE articles ADD COLUMN edu_fields TEXT DEFAULT ''")
+    conn.commit()
     return conn
 
 
@@ -238,14 +373,17 @@ def ingest_articles(conn, batch_date, list_type, articles, source_kind, raw_text
         url = a.get("original_url", "")
         if not url:
             continue
+        title = a.get("title", "")
         cur = conn.execute(
             "INSERT OR IGNORE INTO articles(batch_id, batch_date, list_type, title, publisher, "
-            "publisher_domain, original_url, clean_url, published_at, engine, queries, input_order, collected_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (batch_id, batch_date, list_type, a.get("title", ""), a.get("publisher", ""),
+            "publisher_domain, original_url, clean_url, published_at, engine, queries, input_order, "
+            "collected_at, article_type, edu_fields) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (batch_id, batch_date, list_type, title, a.get("publisher", ""),
              a.get("publisher_domain", "") or urllib.parse.urlsplit(url).netloc,
              url, clean_url(url), a.get("published_at", ""), a.get("engine", ""),
-             a.get("queries", ""), order, _now()))
+             a.get("queries", ""), order, _now(),
+             classify_type(title), ",".join(classify_fields(title))))
         if cur.rowcount == 1:
             new += 1
         else:
@@ -294,7 +432,8 @@ def mark_article(conn, article_id, read_status=None, favorite=None, excluded=Non
 
 def search_articles(conn, q=None, date=None, list_type=None, publisher=None,
                     favorite=None, read_status=None, interest_only=False,
-                    include_excluded=False, limit=100):
+                    include_excluded=False, selected=False, article_type=None,
+                    edu_field=None, limit=100):
     """검색 결과를 dict 목록으로 반환. interest_hits는 조회 시점 관심 키워드 대조."""
     sql = ("SELECT a.*, COALESCE(u.read_status, 'unread') AS read_status, "
            "COALESCE(u.favorite, 0) AS favorite, COALESCE(u.excluded, 0) AS excluded, "
@@ -302,6 +441,14 @@ def search_articles(conn, q=None, date=None, list_type=None, publisher=None,
            "FROM articles a LEFT JOIN user_actions u "
            "ON u.target_type = 'article' AND u.target_id = a.article_id WHERE 1=1")
     vals = []
+    if selected:
+        # 선별 기사 = 브리핑 md 배치로 처음 저장된 기사 (풀 전용 후보 제외)
+        sql += (" AND a.batch_id IN (SELECT batch_id FROM source_batches "
+                "WHERE source_kind = 'briefing-md')")
+    if article_type:
+        sql += " AND a.article_type = ?"; vals.append(article_type)
+    if edu_field:
+        sql += " AND a.edu_fields LIKE ?"; vals.append(f"%{edu_field}%")
     if q:
         sql += " AND (a.title LIKE ? OR a.publisher LIKE ?)"
         vals.extend([f"%{q}%", f"%{q}%"])
@@ -362,6 +509,101 @@ def export_md(conn, batch_date=None, rows=None) -> str:
             lines.append(r["original_url"])
             lines.append("")
     return "\n".join(lines).rstrip() + "\n"
+
+
+TYPE_ORDER = ["정책·현안", "비판·점검", "인터뷰·기획", "사업·성과", "타 시도 동향", "행사·모집", "기타"]
+
+
+def list_groups(conn, batch_date: str) -> list:
+    """날짜별 그룹 목록 (대표기사·구성원 포함), 성격 우선순위 정렬."""
+    groups = []
+    for g in conn.execute(
+            "SELECT g.*, COUNT(i.article_id) AS member_count FROM article_groups g "
+            "JOIN article_group_items i ON i.group_id = g.group_id "
+            "JOIN articles a ON a.article_id = g.representative_article_id "
+            "WHERE a.batch_date = ? GROUP BY g.group_id", (batch_date,)).fetchall():
+        d = dict(g)
+        d["members"] = [dict(r) for r in conn.execute(
+            "SELECT a.article_id, a.title, "
+            "COALESCE(NULLIF(a.publisher, ''), a.publisher_domain) AS publisher, "
+            "a.original_url FROM article_group_items i "
+            "JOIN articles a ON a.article_id = i.article_id WHERE i.group_id = ? "
+            "ORDER BY a.published_at", (g["group_id"],)).fetchall()]
+        groups.append(d)
+    groups.sort(key=lambda g: (TYPE_ORDER.index(g["article_type"]) if g["article_type"] in TYPE_ORDER else 99,
+                               -g["member_count"]))
+    return groups
+
+
+def set_group_summary(conn, group_id: int, summary: str):
+    conn.execute("UPDATE article_groups SET summary = ?, updated_at = ? WHERE group_id = ?",
+                 (summary, _now(), group_id))
+    conn.commit()
+
+
+def digest_md(conn, batch_date: str) -> str:
+    """계획서 10.2 형식의 일일 정리 md: 핵심 이슈(묶음) → 내 관심업무 → 전체 기사."""
+    rows = search_articles(conn, date=batch_date, limit=2000)
+    groups = list_groups(conn, batch_date)
+    grouped_ids = {m["article_id"] for g in groups for m in g["members"]}
+
+    lines = [f"# {batch_date} 교육뉴스 정리", ""]
+
+    if groups:
+        lines += ["## 오늘의 핵심 이슈", ""]
+        for g in groups:
+            rep = next((m for m in g["members"] if m["article_id"] == g["representative_article_id"]),
+                       g["members"][0])
+            lines.append(f"### {g['group_title']}")
+            lines.append("")
+            lines.append(f"- 성격: {g['article_type']} / 분야: {g['category']}")
+            lines.append(f"- 관련 보도: {g['member_count']}건")
+            if g["summary"]:
+                lines.append(f"- 요약: {g['summary']}")
+            lines.append(f"- 대표기사: {rep['title']} - {rep['publisher']}")
+            lines.append(f"  {rep['original_url']}")
+            others = [m for m in g["members"] if m["article_id"] != rep["article_id"]]
+            if others:
+                lines.append("- 관련 기사: " + " / ".join(f"{m['publisher']}" for m in others))
+            lines.append("")
+
+    interest_rows = [r for r in rows if r["interest_hits"]]
+    if interest_rows:
+        lines += ["## 내 관심업무", ""]
+        for r in interest_rows:
+            lines.append(f"■ {r['title']} - {r['publisher']}  [{'·'.join(r['interest_hits'])}]")
+            lines.append(r["original_url"])
+            if r["memo"]:
+                lines.append(f"  메모: {r['memo']}")
+            lines.append("")
+
+    singles = [r for r in rows if r["article_id"] not in grouped_ids]
+    by_type = {}
+    for r in singles:
+        by_type.setdefault(r["article_type"] or "기타", []).append(r)
+    lines += ["## 전체 기사 (묶음 외)", ""]
+    for t in TYPE_ORDER:
+        if t not in by_type:
+            continue
+        lines.append(f"### {t}")
+        lines.append("")
+        for r in by_type[t]:
+            lines.append(f"■ {r['title']} - {r['publisher']}")
+            lines.append(r["original_url"])
+            lines.append("")
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def classify_backfill(conn) -> int:
+    """분류 누락 기사(기존 DB) 재분류."""
+    n = 0
+    for r in conn.execute("SELECT article_id, title FROM articles "
+                          "WHERE article_type = '' OR article_type IS NULL").fetchall():
+        conn.execute("UPDATE articles SET article_type = ?, edu_fields = ? WHERE article_id = ?",
+                     (classify_type(r["title"]), ",".join(classify_fields(r["title"])), r["article_id"]))
+        n += 1
+    conn.commit()
+    return n
 
 
 def export_csv_rows(rows) -> list:
@@ -437,6 +679,21 @@ def main(argv=None):
     p.add_argument("--format", choices=["md", "csv"], default="md")
     p.add_argument("--out", help="저장 경로 (생략 시 표준 출력)")
 
+    p = sub.add_parser("group", help="동일보도 묶음 생성/재생성")
+    p.add_argument("--date", required=True)
+
+    p = sub.add_parser("groups", help="묶음 목록·요약 관리")
+    p.add_argument("action", choices=["list", "summary"])
+    p.add_argument("--date")
+    p.add_argument("--id", type=int)
+    p.add_argument("--text")
+
+    p = sub.add_parser("digest", help="일일 정리 md (핵심 이슈→관심→전체)")
+    p.add_argument("--date", required=True)
+    p.add_argument("--out")
+
+    sub.add_parser("classify", help="분류 누락 기사 재분류 (기존 DB 백필)")
+
     sub.add_parser("stats", help="누적 현황")
 
     args = parser.parse_args(argv)
@@ -506,6 +763,38 @@ def main(argv=None):
             print(f"저장: {args.out} ({len(rows)}건)")
         else:
             print(content)
+
+    elif args.cmd == "group":
+        made = build_groups(conn, args.date)
+        print(f"{args.date}: 묶음 {made}개 생성")
+
+    elif args.cmd == "groups":
+        if args.action == "list":
+            if not args.date:
+                parser.error("groups list에는 --date가 필요합니다")
+            for g in list_groups(conn, args.date):
+                summary = f" | {g['summary']}" if g["summary"] else ""
+                print(f"[G{g['group_id']}] ({g['article_type']}/{g['category']}) "
+                      f"{g['group_title']} — 관련 {g['member_count']}건{summary}")
+                for m in g["members"]:
+                    print(f"    #{m['article_id']} {m['publisher']}: {m['title']}")
+        else:
+            if not (args.id and args.text is not None):
+                parser.error("groups summary에는 --id와 --text가 필요합니다")
+            set_group_summary(conn, args.id, args.text)
+            print(f"G{args.id} 요약 저장")
+
+    elif args.cmd == "digest":
+        content = digest_md(conn, args.date)
+        if args.out:
+            Path(args.out).write_text(content, encoding="utf-8", newline="\n")
+            print(f"저장: {args.out}")
+        else:
+            print(content)
+
+    elif args.cmd == "classify":
+        n = classify_backfill(conn)
+        print(f"재분류 {n}건")
 
     elif args.cmd == "stats":
         total = conn.execute("SELECT COUNT(*) FROM articles").fetchone()[0]
