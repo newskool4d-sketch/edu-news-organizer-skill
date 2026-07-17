@@ -541,57 +541,103 @@ def set_group_summary(conn, group_id: int, summary: str):
     conn.commit()
 
 
-def digest_md(conn, batch_date: str) -> str:
-    """계획서 10.2 형식의 일일 정리 md: 핵심 이슈(묶음) → 내 관심업무 → 전체 기사."""
+def build_digest_data(conn, batch_date: str) -> dict:
+    """다이제스트 공유 데이터 구조. md·html 렌더러가 모두 이 데이터를 소비한다."""
     rows = search_articles(conn, date=batch_date, limit=2000)
     groups = list_groups(conn, batch_date)
     grouped_ids = {m["article_id"] for g in groups for m in g["members"]}
 
+    hero_issues = []
+    for g in groups:
+        rep = next((m for m in g["members"] if m["article_id"] == g["representative_article_id"]),
+                   g["members"][0])
+        others = [m for m in g["members"] if m["article_id"] != rep["article_id"]]
+        hero_issues.append({
+            "group_id": g["group_id"],
+            "title": g["group_title"],
+            "article_type": g["article_type"] or "기타",
+            "fields": [f for f in (g["category"] or "").split(",") if f],
+            "member_count": g["member_count"],
+            "summary": g["summary"],
+            "representative": rep,
+            "others": others,
+        })
+
+    interest_articles = [r for r in rows if r["interest_hits"]]
+
+    singles = [r for r in rows if r["article_id"] not in grouped_ids]
+    by_type = {}
+    for r in singles:
+        by_type.setdefault(r["article_type"] or "기타", []).append(r)
+    all_by_type = [(t, by_type[t]) for t in TYPE_ORDER if t in by_type]
+
+    publishers = {r["publisher"] for r in rows if r["publisher"]}
+    return {
+        "batch_date": batch_date,
+        "meta": {
+            "total": len(rows),
+            "issue_count": len(hero_issues),
+            "interest_count": len(interest_articles),
+            "publisher_count": len(publishers),
+        },
+        "hero_issues": hero_issues,
+        "interest_articles": interest_articles,
+        "all_by_type": all_by_type,
+    }
+
+
+def digest_md(conn, batch_date: str) -> str:
+    """계획서 10.2 형식의 일일 정리 md: 핵심 이슈(묶음) → 내 관심업무 → 전체 기사."""
+    data = build_digest_data(conn, batch_date)
     lines = [f"# {batch_date} 교육뉴스 정리", ""]
 
-    if groups:
+    if data["hero_issues"]:
         lines += ["## 오늘의 핵심 이슈", ""]
-        for g in groups:
-            rep = next((m for m in g["members"] if m["article_id"] == g["representative_article_id"]),
-                       g["members"][0])
-            lines.append(f"### {g['group_title']}")
+        for g in data["hero_issues"]:
+            rep = g["representative"]
+            lines.append(f"### {g['title']}")
             lines.append("")
-            lines.append(f"- 성격: {g['article_type']} / 분야: {g['category']}")
+            lines.append(f"- 성격: {g['article_type']} / 분야: {', '.join(g['fields'])}")
             lines.append(f"- 관련 보도: {g['member_count']}건")
             if g["summary"]:
                 lines.append(f"- 요약: {g['summary']}")
             lines.append(f"- 대표기사: {rep['title']} - {rep['publisher']}")
             lines.append(f"  {rep['original_url']}")
-            others = [m for m in g["members"] if m["article_id"] != rep["article_id"]]
-            if others:
-                lines.append("- 관련 기사: " + " / ".join(f"{m['publisher']}" for m in others))
+            if g["others"]:
+                lines.append("- 관련 기사: " + " / ".join(m["publisher"] for m in g["others"]))
             lines.append("")
 
-    interest_rows = [r for r in rows if r["interest_hits"]]
-    if interest_rows:
+    if data["interest_articles"]:
         lines += ["## 내 관심업무", ""]
-        for r in interest_rows:
+        for r in data["interest_articles"]:
             lines.append(f"■ {r['title']} - {r['publisher']}  [{'·'.join(r['interest_hits'])}]")
             lines.append(r["original_url"])
             if r["memo"]:
                 lines.append(f"  메모: {r['memo']}")
             lines.append("")
 
-    singles = [r for r in rows if r["article_id"] not in grouped_ids]
-    by_type = {}
-    for r in singles:
-        by_type.setdefault(r["article_type"] or "기타", []).append(r)
     lines += ["## 전체 기사 (묶음 외)", ""]
-    for t in TYPE_ORDER:
-        if t not in by_type:
-            continue
+    for t, items in data["all_by_type"]:
         lines.append(f"### {t}")
         lines.append("")
-        for r in by_type[t]:
+        for r in items:
             lines.append(f"■ {r['title']} - {r['publisher']}")
             lines.append(r["original_url"])
             lines.append("")
     return "\n".join(lines).rstrip() + "\n"
+
+
+def render_digest_html(data: dict) -> str:
+    """프리미엄 HTML 다이제스트 렌더. 인천교육청 CI 팔레트·로고 임베드. digest_html 모듈 위임."""
+    import digest_html
+    return digest_html.render(data, load_logo_datauri())
+
+
+def load_logo_datauri() -> str:
+    p = Path(__file__).parent / "incheon_logo.txt"
+    if p.exists():
+        return p.read_text(encoding="utf-8").strip()
+    return ""
 
 
 def classify_backfill(conn) -> int:
@@ -688,8 +734,9 @@ def main(argv=None):
     p.add_argument("--id", type=int)
     p.add_argument("--text")
 
-    p = sub.add_parser("digest", help="일일 정리 md (핵심 이슈→관심→전체)")
+    p = sub.add_parser("digest", help="일일 정리 (핵심 이슈→관심→전체)")
     p.add_argument("--date", required=True)
+    p.add_argument("--format", choices=["md", "html"], default="md")
     p.add_argument("--out")
 
     sub.add_parser("classify", help="분류 누락 기사 재분류 (기존 DB 백필)")
@@ -785,7 +832,10 @@ def main(argv=None):
             print(f"G{args.id} 요약 저장")
 
     elif args.cmd == "digest":
-        content = digest_md(conn, args.date)
+        if args.format == "html":
+            content = render_digest_html(build_digest_data(conn, args.date))
+        else:
+            content = digest_md(conn, args.date)
         if args.out:
             Path(args.out).write_text(content, encoding="utf-8", newline="\n")
             print(f"저장: {args.out}")

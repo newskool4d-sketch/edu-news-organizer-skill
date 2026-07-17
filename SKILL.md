@@ -37,9 +37,18 @@ python scripts/newsdb.py ingest --paste <목록.txt>                  # 본청 �
 python scripts/newsdb.py search --q 학생교육원 --favorite --limit 20
 python scripts/newsdb.py mark --id 12 --favorite --memo "2027 캠프 계획 참고"
 python scripts/newsdb.py interests list|add|remove|seed
+python scripts/newsdb.py group --date 2026-07-16                   # 동일보도 묶기
+python scripts/newsdb.py groups list --date 2026-07-16             # 묶음·요약 확인
+python scripts/newsdb.py groups summary --id 12 --text "요약문"     # 이슈 요약 저장
+python scripts/newsdb.py digest --date 2026-07-16 --format md      # 정리본 md
+python scripts/newsdb.py digest --date 2026-07-16 --format html --out 다이제스트.html  # 프리미엄 HTML
 python scripts/newsdb.py export --date 2026-07-16 --format md
 python scripts/newsdb.py stats
 ```
+
+HTML 다이제스트는 인천광역시교육청 CI 팔레트 기반 에디토리얼 브리핑(로고 임베드·자기완결)이다.
+러너 자동 실행 시 브리핑 폴더에 `교육뉴스 다이제스트.html`로 함께 저장된다.
+이슈 요약(`groups summary`)은 담당자가 검토·작성한다 — 기계 요약으로 사실을 지어내지 않는다.
 
 - DB 위치: `%USERPROFILE%\Documents\Codex\EduNewsOrganizer\news.db` (환경변수 `EDU_NEWS_DB_PATH` 또는 `--db`로 변경)
 - 원본 목록(raw_text)은 source_batches에 그대로 보존한다 (기본 원칙: 원본 보존)
