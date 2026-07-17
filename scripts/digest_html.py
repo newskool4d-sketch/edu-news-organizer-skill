@@ -113,7 +113,8 @@ def _all_row(r: dict) -> str:
             f'<span class="row-pub">{esc(r["publisher"])}</span></li>')
 
 
-def render(data: dict, logo_uri: str = "") -> str:
+def render(data: dict, logo_uri: str = "", public: bool = False) -> str:
+    """public=True면 개인 데이터(내 관심업무·메모)를 빼고 비공식 표기를 넣은 공개 안전본을 만든다."""
     meta = data["meta"]
     date_disp = _fmt_date(data["batch_date"])
     gen_at = datetime.now().strftime("%Y-%m-%d %H:%M")
@@ -123,8 +124,14 @@ def render(data: dict, logo_uri: str = "") -> str:
 
     stats = (_stat(meta["total"], "수집 기사")
              + _stat(meta["issue_count"], "핵심 이슈")
-             + _stat(meta["interest_count"], "내 관심")
              + _stat(meta["publisher_count"], "매체"))
+    if not public:
+        stats = (_stat(meta["total"], "수집 기사")
+                 + _stat(meta["issue_count"], "핵심 이슈")
+                 + _stat(meta["interest_count"], "내 관심")
+                 + _stat(meta["publisher_count"], "매체"))
+
+    unofficial_tag = '<span class="unofficial">비공식 · 개인 정리용</span>' if public else ''
 
     hero_html = ""
     if data["hero_issues"]:
@@ -137,7 +144,7 @@ def render(data: dict, logo_uri: str = "") -> str:
     </section>'''
 
     interest_html = ""
-    if data["interest_articles"]:
+    if data["interest_articles"] and not public:
         items = "".join(_interest_item(r) for r in data["interest_articles"])
         interest_html = f'''
     <section class="section section-interest">
@@ -296,6 +303,11 @@ def render(data: dict, logo_uri: str = "") -> str:
     background:var(--flow); margin-right:6px; vertical-align:middle; }}
 
   .empty {{ padding:40px; text-align:center; color:var(--faint); font-weight:600; }}
+  .unofficial {{ display:inline-block; margin-left:8px; padding:2px 9px; border-radius:20px;
+    background:#fff1e6; color:#c05a17; border:1px solid #f3d3b6; font-size:10.5px;
+    font-weight:800; letter-spacing:0; vertical-align:middle; }}
+  .disclaimer {{ margin-top:6px; color:var(--faint); }}
+  .disclaimer b {{ color:var(--orange); }}
 
   /* ---- Responsive ---- */
   @media (max-width:720px) {{
@@ -320,7 +332,7 @@ def render(data: dict, logo_uri: str = "") -> str:
     <div class="mast-inner">
       {logo_html}
       <div class="mast-text">
-        <p class="kicker">Incheon Education · Morning Press Brief</p>
+        <p class="kicker">Incheon Education · Morning Press Brief {unofficial_tag}</p>
         <h1 class="mast-title">인천교육 언론보도 브리핑</h1>
         <p class="mast-date">{esc(date_disp)} 점검 기준</p>
       </div>
@@ -335,6 +347,7 @@ def render(data: dict, logo_uri: str = "") -> str:
     <footer class="foot">
       <p><span class="flow-dot"></span><b>인천광역시교육청 및 산하기관 언론보도</b>를 현안성·기관 관련성·후속 대응 필요성 기준으로 정리한 개인 브리핑입니다.</p>
       <p>점검일 {esc(data["batch_date"])} · 생성 시각 {esc(gen_at)} · 동일보도는 대표기사 1건으로 묶고 관련 매체를 병기했습니다. 이슈 요약은 담당자가 검토·작성한 내용입니다.</p>
+      {'<p class="disclaimer">본 페이지는 공개된 뉴스 링크를 개인이 정리한 <b>비공식 자료</b>이며, 인천광역시교육청의 공식 발행물이 아닙니다.</p>' if public else ''}
     </footer>
   </main>
 </body>

@@ -50,6 +50,17 @@ HTML 다이제스트는 인천광역시교육청 CI 팔레트 기반 에디토�
 러너 자동 실행 시 브리핑 폴더에 `교육뉴스 다이제스트.html`로 함께 저장된다.
 이슈 요약(`groups summary`)은 담당자가 검토·작성한다 — 기계 요약으로 사실을 지어내지 않는다.
 
+## 웹 배포 (선택)
+
+```bash
+python scripts/publish_site.py --site-dir <site폴더> --date 2026-07-16   # 공개 안전본 굽기
+python scripts/publish_site.py --site-dir <site폴더> --date 2026-07-16 --push  # git push까지
+```
+
+`site/`(index·archive)를 GitHub→Vercel로 자동 배포한다. 절차·환경변수·안전 설계는
+[references/deploy-vercel.md](./references/deploy-vercel.md). **웹 배포본은 개인 데이터(내 관심업무·메모)를
+제외한 공개 안전본**이며 "비공식·개인 정리용" 표기가 붙는다. 전체 개인 버전은 로컬 전용.
+
 - DB 위치: `%USERPROFILE%\Documents\Codex\EduNewsOrganizer\news.db` (환경변수 `EDU_NEWS_DB_PATH` 또는 `--db`로 변경)
 - 원본 목록(raw_text)은 source_batches에 그대로 보존한다 (기본 원칙: 원본 보존)
 - 관심도 표시는 저장 시점이 아니라 조회 시점에 interests 테이블과 대조한다 (키워드 변경 즉시 반영)

@@ -627,10 +627,13 @@ def digest_md(conn, batch_date: str) -> str:
     return "\n".join(lines).rstrip() + "\n"
 
 
-def render_digest_html(data: dict) -> str:
-    """프리미엄 HTML 다이제스트 렌더. 인천교육청 CI 팔레트·로고 임베드. digest_html 모듈 위임."""
+def render_digest_html(data: dict, public: bool = False) -> str:
+    """프리미엄 HTML 다이제스트 렌더. 인천교육청 CI 팔레트·로고 임베드. digest_html 모듈 위임.
+
+    public=True: 공개(웹) 안전본 — 개인 데이터(내 관심업무·메모) 제외, 비공식 표기 추가.
+    """
     import digest_html
-    return digest_html.render(data, load_logo_datauri())
+    return digest_html.render(data, load_logo_datauri(), public=public)
 
 
 def load_logo_datauri() -> str:
