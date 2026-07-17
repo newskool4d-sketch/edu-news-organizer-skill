@@ -113,8 +113,12 @@ def _all_row(r: dict) -> str:
             f'<span class="row-pub">{esc(r["publisher"])}</span></li>')
 
 
-def render(data: dict, logo_uri: str = "", public: bool = False) -> str:
-    """public=True면 개인 데이터(내 관심업무·메모)를 빼고 비공식 표기를 넣은 공개 안전본을 만든다."""
+def render(data: dict, logo_uri: str = "", public: bool = False,
+           slogan_uri: str = "", title_uri: str = "") -> str:
+    """public=True면 개인 데이터(내 관심업무·메모)를 빼고 비공식 표기를 넣은 공개 안전본을 만든다.
+
+    slogan_uri/title_uri: 공식 서체(소통·힘찬)로 사전 렌더한 PNG data URI — 웹폰트 없이 브랜드 서체 반영.
+    """
     meta = data["meta"]
     date_disp = _fmt_date(data["batch_date"])
     gen_at = datetime.now().strftime("%Y-%m-%d %H:%M")
@@ -132,6 +136,12 @@ def render(data: dict, logo_uri: str = "", public: bool = False) -> str:
                  + _stat(meta["publisher_count"], "매체"))
 
     unofficial_tag = '<span class="unofficial">비공식 · 개인 정리용</span>' if public else ''
+
+    # 공식 서체 자산: 제목(힘찬)·슬로건(소통) — 없으면 텍스트 폴백
+    title_html = (f'<img class="mast-title-img" src="{esc(title_uri)}" alt="인천교육 언론보도 브리핑" />'
+                  if title_uri else '<span>인천교육 언론보도 브리핑</span>')
+    slogan_html = (f'<img class="slogan-img" src="{esc(slogan_uri)}" alt="학생성공시대를 여는 인천교육" />'
+                   if slogan_uri else '')
 
     hero_html = ""
     if data["hero_issues"]:
@@ -151,6 +161,28 @@ def render(data: dict, logo_uri: str = "", public: bool = False) -> str:
       <div class="sec-head"><span class="sec-bar orange"></span><h2>내 관심업무</h2>
         <span class="sec-count">{len(data["interest_articles"])}건</span></div>
       <ul class="int-list">{items}</ul>
+    </section>'''
+
+    other_html = ""
+    other_issues = data.get("other_issues", [])
+    other_articles = data.get("other_articles", [])
+    if other_issues or other_articles:
+        rows = []
+        for g in other_issues:
+            rep = g["representative"]
+            rows.append(
+                f'<li class="row"><span class="row-title">{_link(rep["original_url"], g["title"])}'
+                f'<span class="row-count">관련 {esc(g["member_count"])}건</span></span>'
+                f'<span class="row-pub">{esc(rep["publisher"])}</span></li>')
+        for r in other_articles:
+            rows.append(_all_row(r))
+        other_count = len(other_issues) + len(other_articles)
+        other_html = f'''
+    <section class="section section-other">
+      <div class="sec-head"><span class="sec-bar slate"></span><h2>타 시도·일반 교육 동향</h2>
+        <span class="sec-count slate-count">{other_count}건</span>
+        <span class="sec-sub">인천 외 참고 뉴스</span></div>
+      <div class="other-panel"><ul class="rows">{"".join(rows)}</ul></div>
     </section>'''
 
     all_html = ""
@@ -306,6 +338,20 @@ def render(data: dict, logo_uri: str = "", public: bool = False) -> str:
   .unofficial {{ display:inline-block; margin-left:8px; padding:2px 9px; border-radius:20px;
     background:#fff1e6; color:#c05a17; border:1px solid #f3d3b6; font-size:10.5px;
     font-weight:800; letter-spacing:0; vertical-align:middle; }}
+
+  /* ---- 공식 서체 자산 (힘찬 제목·소통 슬로건) ---- */
+  .mast-title-img {{ display:block; height:38px; width:auto; max-width:100%; }}
+  .slogan-img {{ display:block; height:24px; width:auto; max-width:100%; margin-top:10px; }}
+
+  /* ---- 타 시도·일반 교육 동향 (인천 뉴스와 분리, 차분한 슬레이트 톤) ---- */
+  .sec-bar.slate {{ background:#5B6B7C; }}
+  .slate-count {{ background:#5B6B7C; }}
+  .section-other .other-panel {{ background:#f6f8fa; border:1px solid var(--line);
+    border-radius:14px; padding:8px 18px; }}
+  .section-other .row-title a {{ color:var(--muted); }}
+  .section-other .row-title a:hover {{ color:var(--blue); }}
+  .row-count {{ margin-left:8px; font-size:11px; font-weight:700; color:#5B6B7C;
+    background:#e8edf2; padding:1px 8px; border-radius:12px; white-space:nowrap; }}
   .disclaimer {{ margin-top:6px; color:var(--faint); }}
   .disclaimer b {{ color:var(--orange); }}
 
@@ -333,8 +379,9 @@ def render(data: dict, logo_uri: str = "", public: bool = False) -> str:
       {logo_html}
       <div class="mast-text">
         <p class="kicker">Incheon Education · Morning Press Brief {unofficial_tag}</p>
-        <h1 class="mast-title">인천교육 언론보도 브리핑</h1>
+        <h1 class="mast-title">{title_html}</h1>
         <p class="mast-date">{esc(date_disp)} 점검 기준</p>
+        {slogan_html}
       </div>
       <div class="stat-strip">{stats}</div>
     </div>
@@ -343,7 +390,8 @@ def render(data: dict, logo_uri: str = "", public: bool = False) -> str:
     {hero_html or ''}
     {interest_html or ''}
     {all_html or ''}
-    {'<div class="empty">확인된 유의미 기사 없음</div>' if not (data["hero_issues"] or data["interest_articles"] or data["all_by_type"]) else ''}
+    {other_html or ''}
+    {'<div class="empty">확인된 유의미 기사 없음</div>' if not (data["hero_issues"] or data["interest_articles"] or data["all_by_type"] or other_html) else ''}
     <footer class="foot">
       <p><span class="flow-dot"></span><b>인천광역시교육청 및 산하기관 언론보도</b>를 현안성·기관 관련성·후속 대응 필요성 기준으로 정리한 개인 브리핑입니다.</p>
       <p>점검일 {esc(data["batch_date"])} · 생성 시각 {esc(gen_at)} · 동일보도는 대표기사 1건으로 묶고 관련 매체를 병기했습니다. 이슈 요약은 담당자가 검토·작성한 내용입니다.</p>

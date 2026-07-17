@@ -541,18 +541,32 @@ def set_group_summary(conn, group_id: int, summary: str):
     conn.commit()
 
 
+# 인천 관련성 판별 마커 — 제목 기반 (지역명·교육감·군구·개발지구)
+INCHEON_MARKERS = ["인천", "도성훈", "강화", "옹진", "영종", "검단", "송도",
+                   "부평", "계양", "미추홀", "연수구", "남동구"]
+
+
+def is_incheon_title(title: str) -> bool:
+    """제목에 인천 마커가 있으면 인천교육 뉴스로 본다. 타시도·일반교육(전국) 뉴스와 분리용."""
+    return any(m in title for m in INCHEON_MARKERS)
+
+
 def build_digest_data(conn, batch_date: str) -> dict:
-    """다이제스트 공유 데이터 구조. md·html 렌더러가 모두 이 데이터를 소비한다."""
+    """다이제스트 공유 데이터 구조. md·html 렌더러가 모두 이 데이터를 소비한다.
+
+    인천 뉴스(hero_issues·all_by_type)와 타시도·일반교육 뉴스(other_issues·other_articles)를 분리한다.
+    묶음은 구성 기사 중 한 건이라도 인천 마커가 있으면 인천으로 분류.
+    """
     rows = search_articles(conn, date=batch_date, limit=2000)
     groups = list_groups(conn, batch_date)
     grouped_ids = {m["article_id"] for g in groups for m in g["members"]}
 
-    hero_issues = []
+    hero_issues, other_issues = [], []
     for g in groups:
         rep = next((m for m in g["members"] if m["article_id"] == g["representative_article_id"]),
                    g["members"][0])
         others = [m for m in g["members"] if m["article_id"] != rep["article_id"]]
-        hero_issues.append({
+        issue = {
             "group_id": g["group_id"],
             "title": g["group_title"],
             "article_type": g["article_type"] or "기타",
@@ -561,13 +575,19 @@ def build_digest_data(conn, batch_date: str) -> dict:
             "summary": g["summary"],
             "representative": rep,
             "others": others,
-        })
+        }
+        if any(is_incheon_title(m["title"]) for m in g["members"]):
+            hero_issues.append(issue)
+        else:
+            other_issues.append(issue)
 
     interest_articles = [r for r in rows if r["interest_hits"]]
 
     singles = [r for r in rows if r["article_id"] not in grouped_ids]
+    incheon_singles = [r for r in singles if is_incheon_title(r["title"])]
+    other_articles = [r for r in singles if not is_incheon_title(r["title"])]
     by_type = {}
-    for r in singles:
+    for r in incheon_singles:
         by_type.setdefault(r["article_type"] or "기타", []).append(r)
     all_by_type = [(t, by_type[t]) for t in TYPE_ORDER if t in by_type]
 
@@ -579,10 +599,13 @@ def build_digest_data(conn, batch_date: str) -> dict:
             "issue_count": len(hero_issues),
             "interest_count": len(interest_articles),
             "publisher_count": len(publishers),
+            "other_count": len(other_articles) + sum(g["member_count"] for g in other_issues),
         },
         "hero_issues": hero_issues,
+        "other_issues": other_issues,
         "interest_articles": interest_articles,
         "all_by_type": all_by_type,
+        "other_articles": other_articles,
     }
 
 
@@ -624,6 +647,18 @@ def digest_md(conn, batch_date: str) -> str:
             lines.append(f"■ {r['title']} - {r['publisher']}")
             lines.append(r["original_url"])
             lines.append("")
+
+    if data["other_issues"] or data["other_articles"]:
+        lines += ["## 타 시도·일반 교육 동향", ""]
+        for g in data["other_issues"]:
+            rep = g["representative"]
+            lines.append(f"■ {g['title']} - {rep['publisher']} (관련 {g['member_count']}건)")
+            lines.append(rep["original_url"])
+            lines.append("")
+        for r in data["other_articles"]:
+            lines.append(f"■ {r['title']} - {r['publisher']}")
+            lines.append(r["original_url"])
+            lines.append("")
     return "\n".join(lines).rstrip() + "\n"
 
 
@@ -633,14 +668,20 @@ def render_digest_html(data: dict, public: bool = False) -> str:
     public=True: 공개(웹) 안전본 — 개인 데이터(내 관심업무·메모) 제외, 비공식 표기 추가.
     """
     import digest_html
-    return digest_html.render(data, load_logo_datauri(), public=public)
+    return digest_html.render(data, load_logo_datauri(), public=public,
+                              slogan_uri=load_asset("incheon_slogan.txt"),
+                              title_uri=load_asset("incheon_masttitle.txt"))
 
 
-def load_logo_datauri() -> str:
-    p = Path(__file__).parent / "incheon_logo.txt"
+def load_asset(name: str) -> str:
+    p = Path(__file__).parent / name
     if p.exists():
         return p.read_text(encoding="utf-8").strip()
     return ""
+
+
+def load_logo_datauri() -> str:
+    return load_asset("incheon_logo.txt")
 
 
 def classify_backfill(conn) -> int:
