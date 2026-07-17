@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+# 개인 데이터 DB는 저장소 밖(Documents\Codex\EduNewsOrganizer)이 기본이지만, 실수 방지로 차단
+*.db
+*.sqlite3
