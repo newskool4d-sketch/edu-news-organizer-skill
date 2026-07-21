@@ -4,6 +4,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "scripts"))
 import newsdb  # noqa: E402
@@ -58,12 +59,41 @@ class TestArchiveIndex(unittest.TestCase):
         i15 = html.find("2026-07-15")
         i14 = html.find("2026-07-14")
         self.assertTrue(i16 < i15 < i14)
-        # 각 날짜가 아카이브 링크로
-        self.assertIn('href="archive/2026-07-16.html"', html)
+        # archive/index.html 기준으로 날짜 파일과 최신 루트에 연결
+        self.assertIn('href="2026-07-16.html"', html)
+        self.assertNotIn('href="archive/2026-07-16.html"', html)
+        self.assertIn('href="../index.html"', html)
+
+    def test_latest_page_has_archive_navigation(self):
+        digest = '<html><head><style></style></head><body><main class="wrap"></main></body></html>'
+        html = publish_site.render_latest_page(digest)
+        self.assertIn('class="site-nav"', html)
+        self.assertIn('href="archive/index.html"', html)
+        self.assertIn("지난 호 보기", html)
+
+    def test_latest_page_requires_expected_digest_structure(self):
+        with self.assertRaises(ValueError):
+            publish_site.render_latest_page("<html><body></body></html>")
 
     def test_archive_index_escapes(self):
         html = publish_site.render_archive_index(["2026-07-16"])
         self.assertNotIn("<script>alert", html)
+
+
+class TestGitPush(unittest.TestCase):
+    @mock.patch("publish_site.subprocess.run")
+    def test_git_push_uses_iso_date_in_commit_message(self, run):
+        run.return_value = mock.Mock(returncode=0, stdout="", stderr="")
+        publish_site.git_push(Path("site"), "2026-07-21")
+        commands = [call.args[0] for call in run.call_args_list]
+        self.assertEqual(commands[1], ["git", "commit", "-m", "다이제스트 갱신: 2026-07-21"])
+        self.assertEqual(commands[2], ["git", "push"])
+
+    @mock.patch("publish_site.subprocess.run")
+    def test_git_push_surfaces_command_failure(self, run):
+        run.return_value = mock.Mock(returncode=1, stdout="", stderr="authentication failed")
+        with self.assertRaisesRegex(RuntimeError, "authentication failed"):
+            publish_site.git_push(Path("site"), "2026-07-21")
 
 
 if __name__ == "__main__":

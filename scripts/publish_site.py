@@ -48,7 +48,7 @@ def render_archive_index(dates: list) -> str:
     """날짜 목록(ISO) → 아카이브 인덱스 HTML. 최신순 정렬, 자기완결."""
     dates = sorted(set(dates), reverse=True)
     items = "\n".join(
-        f'    <li><a href="archive/{esc(d)}.html"><span class="d">{esc(d)}</span>'
+        f'    <li><a href="{esc(d)}.html"><span class="d">{esc(d)}</span>'
         f'<span class="w">{esc(_fmt(d))}</span></a></li>'
         for d in dates)
     return f'''<!doctype html>
@@ -81,7 +81,7 @@ def render_archive_index(dates: list) -> str:
 <body>
   <div class="flow-band"></div>
   <div class="wrap">
-    <a class="home" href="index.html">← 최신 브리핑</a>
+    <a class="home" href="../index.html">← 최신 브리핑</a>
     <h1>지난 호 보기</h1>
     <p class="sub">인천교육 언론보도 브리핑 아카이브 (비공식 · 개인 정리용)</p>
     <ul>
@@ -90,6 +90,29 @@ def render_archive_index(dates: list) -> str:
   </div>
 </body>
 </html>'''
+
+
+def render_latest_page(digest_html: str) -> str:
+    """공개 다이제스트에 지난 호 진입 링크를 추가한 최신 페이지를 만든다."""
+    style_anchor = "</style>"
+    main_anchor = '<main class="wrap">'
+    if style_anchor not in digest_html or main_anchor not in digest_html:
+        raise ValueError("다이제스트 HTML 구조에서 사이트 탐색 링크 삽입 위치를 찾지 못했습니다.")
+
+    nav_css = '''
+  /* ---- 공개 사이트 탐색 ---- */
+  .site-nav { max-width:1120px; margin:0 auto; padding:14px 22px 0;
+    display:flex; justify-content:flex-end; }
+  .site-nav a { display:inline-flex; align-items:center; gap:6px; padding:8px 13px;
+    border:1px solid var(--line); border-radius:999px; background:var(--card);
+    color:var(--blue); font-size:13px; font-weight:800; box-shadow:0 1px 2px rgba(18,35,58,.04); }
+  @media print { .site-nav { display:none; } }
+'''
+    nav_html = '''<nav class="site-nav" aria-label="브리핑 탐색">
+    <a href="archive/index.html">지난 호 보기 →</a>
+  </nav>'''
+    with_style = digest_html.replace(style_anchor, nav_css + style_anchor, 1)
+    return with_style.replace(main_anchor, nav_html + "\n  " + main_anchor, 1)
 
 
 def existing_dates(site_dir: Path) -> list:
@@ -119,18 +142,20 @@ def build(site_dir: Path, date_iso: str = None, db_path: str = None):
     if dates:
         latest = dates[0]
         latest_html = (site_dir / "archive" / f"{latest}.html").read_text(encoding="utf-8")
-        (site_dir / "index.html").write_text(latest_html, encoding="utf-8", newline="\n")
+        (site_dir / "index.html").write_text(render_latest_page(latest_html), encoding="utf-8", newline="\n")
     (site_dir / "archive" / "index.html").write_text(render_archive_index(dates), encoding="utf-8", newline="\n")
     return dates
 
 
 def git_push(site_dir: Path, date_iso: str):
+    date_label = date_iso or datetime.now().strftime("%Y-%m-%d")
     for args in (["git", "add", "-A"],
-                 ["git", "commit", "-m", f"다이제스트 갱신: {date_iso or datetime.now():%Y-%m-%d}"],
+                 ["git", "commit", "-m", f"다이제스트 갱신: {date_label}"],
                  ["git", "push"]):
         r = subprocess.run(args, cwd=str(site_dir), capture_output=True, text=True)
         if r.returncode != 0 and "nothing to commit" not in (r.stdout + r.stderr):
-            print(f"[git] {' '.join(args)} → {r.stderr.strip() or r.stdout.strip()}", file=sys.stderr)
+            detail = r.stderr.strip() or r.stdout.strip() or f"exit code {r.returncode}"
+            raise RuntimeError(f"[git] {' '.join(args)} 실패: {detail}")
 
 
 def main(argv=None):
