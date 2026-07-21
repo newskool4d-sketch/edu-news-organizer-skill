@@ -10,8 +10,8 @@
 
 ```json
 {
-  "window_start": "2026-07-15 09:00",
-  "window_end": "2026-07-16 09:00",
+  "window_start": "2026-07-15 05:00",
+  "window_end": "2026-07-16 05:00",
   "engine": "google-news-rss",
   "article_count": 312,
   "failures": [{"query": "인천교육청", "label": "Q1", "error": "100건 상한 도달"}],

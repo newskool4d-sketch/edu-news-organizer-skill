@@ -68,6 +68,7 @@ class TestRenderHtml(unittest.TestCase):
         self.assertTrue(html.lstrip().startswith("<!doctype html>"))
         self.assertIn("인천교육청, 조식 지원 확대 발표", html)
         self.assertIn("2026-07-16", html)
+        self.assertIn("2026. 7. 16. (목) 05:00 수집 기준", html)
         self.assertIn("<style>", html)
         # 외부 리소스 없음(자기완결)
         self.assertNotIn("http-equiv=\"refresh\"", html)

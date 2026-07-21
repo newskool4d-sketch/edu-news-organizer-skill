@@ -176,7 +176,7 @@ def render_issue_page(digest_html: str, current_date: str, dates: list, location
         next_html = (f'<a class="nav-btn nav-next" href="{esc(next_href)}">'
                      f'다음 호 ({esc(_fmt_short(next_date))}) ▶</a>')
     else:
-        next_html = '<span class="nav-btn nav-next disabled">다음 호 예정 · 매일 09:00</span>'
+        next_html = '<span class="nav-btn nav-next disabled">다음 호 예정 · 매일 05:00</span>'
 
     nav_html = f'''<!-- EDU_NEWS_SITE_NAV_START -->
   <nav class="issue-nav" aria-label="호별 브리핑 이동">
