@@ -64,16 +64,66 @@ class TestArchiveIndex(unittest.TestCase):
         self.assertNotIn('href="archive/2026-07-16.html"', html)
         self.assertIn('href="../index.html"', html)
 
-    def test_latest_page_has_archive_navigation(self):
+    def test_latest_page_has_previous_current_next_navigation(self):
         digest = '<html><head><style></style></head><body><main class="wrap"></main></body></html>'
-        html = publish_site.render_latest_page(digest)
-        self.assertIn('class="site-nav"', html)
+        dates = ["2026-07-21", "2026-07-20", "2026-07-16"]
+        html = publish_site.render_issue_page(digest, "2026-07-21", dates, location="root")
+        self.assertIn('class="issue-nav"', html)
+        self.assertIn('href="archive/2026-07-20.html"', html)
+        self.assertIn("◀ 지난 호 (7. 20.)", html)
+        self.assertIn("2026. 7. 21. (화)", html)
+        self.assertIn("다음 호 예정 · 매일 09:00", html)
         self.assertIn('href="archive/index.html"', html)
-        self.assertIn("지난 호 보기", html)
+        self.assertIn("전체 지난 호", html)
+
+    def test_archive_page_links_to_older_and_newer_issue(self):
+        digest = '<html><head><style></style></head><body><main class="wrap"></main></body></html>'
+        dates = ["2026-07-21", "2026-07-20", "2026-07-16"]
+        html = publish_site.render_issue_page(digest, "2026-07-20", dates, location="archive")
+        self.assertIn('href="2026-07-16.html"', html)
+        self.assertIn("◀ 지난 호 (7. 16.)", html)
+        self.assertIn('href="../index.html"', html)
+        self.assertIn("다음 호 (7. 21.) ▶", html)
+        self.assertIn('href="index.html"', html)
+
+    def test_oldest_archive_page_disables_previous_issue(self):
+        digest = '<html><head><style></style></head><body><main class="wrap"></main></body></html>'
+        dates = ["2026-07-21", "2026-07-20", "2026-07-16"]
+        html = publish_site.render_issue_page(digest, "2026-07-16", dates, location="archive")
+        self.assertIn('<span class="nav-btn nav-prev disabled">◀ 지난 호</span>', html)
+        self.assertIn('href="2026-07-20.html"', html)
+
+    def test_issue_navigation_is_idempotent(self):
+        digest = '<html><head><style></style></head><body><main class="wrap"></main></body></html>'
+        dates = ["2026-07-21", "2026-07-20"]
+        once = publish_site.render_issue_page(digest, "2026-07-21", dates, location="root")
+        twice = publish_site.render_issue_page(once, "2026-07-21", dates, location="root")
+        self.assertEqual(twice.count('class="issue-nav"'), 1)
+        self.assertEqual(twice.count("EDU_NEWS_SITE_NAV_START"), 2)  # CSS 1 + HTML 1
 
     def test_latest_page_requires_expected_digest_structure(self):
         with self.assertRaises(ValueError):
-            publish_site.render_latest_page("<html><body></body></html>")
+            publish_site.render_issue_page(
+                "<html><body></body></html>", "2026-07-21", ["2026-07-21"], location="root"
+            )
+
+    def test_build_refreshes_navigation_on_all_archived_pages(self):
+        digest = '<html><head><style></style></head><body><main class="wrap"></main></body></html>'
+        with tempfile.TemporaryDirectory() as tmp:
+            site = Path(tmp)
+            archive = site / "archive"
+            archive.mkdir()
+            for date in ("2026-07-21", "2026-07-20", "2026-07-16"):
+                (archive / f"{date}.html").write_text(digest, encoding="utf-8")
+
+            publish_site.build(site)
+
+            latest = (site / "index.html").read_text(encoding="utf-8")
+            middle = (archive / "2026-07-20.html").read_text(encoding="utf-8")
+            oldest = (archive / "2026-07-16.html").read_text(encoding="utf-8")
+            self.assertIn('href="archive/2026-07-20.html"', latest)
+            self.assertIn('href="../index.html"', middle)
+            self.assertIn('href="2026-07-20.html"', oldest)
 
     def test_archive_index_escapes(self):
         html = publish_site.render_archive_index(["2026-07-16"])
