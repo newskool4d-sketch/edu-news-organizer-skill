@@ -63,14 +63,15 @@ python scripts/publish_site.py --site-dir <site폴더> --date 2026-07-16 --push 
 
 - DB 위치: `%USERPROFILE%\Documents\Codex\EduNewsOrganizer\news.db` (환경변수 `EDU_NEWS_DB_PATH` 또는 `--db`로 변경)
 - 원본 목록(raw_text)은 source_batches에 그대로 보존한다 (기본 원칙: 원본 보존)
+- 상류 JSON의 `relevance_hint`·판정 근거·위치/교육주체/학생활동 히트는 기사 단위로 보존하되, 최종 포함 판단으로 사용하지 않는다.
 - 관심도 표시는 저장 시점이 아니라 조회 시점에 interests 테이블과 대조한다 (키워드 변경 즉시 반영)
 
 ## Workflow
 
-1. 입력 종류를 판별한다: 상류 JSON > 브리핑 md > 붙여넣기 텍스트 순으로 정밀하다.
+1. 보관 입력은 상류 JSON이 가장 정밀하지만 원시 후보 풀이다. 공개 다이제스트 입력은 검증 완료 `briefing-md` > 본청 `paste` 순으로 사용하며, `collector-json`만 있는 날짜는 공개하지 않는다.
 2. `ingest` 실행 후 신규/중복 건수를 사용자에게 보고한다. 중복은 clean_url 기준이며 조용히 버리지 않고 건수로 알린다.
 3. 조회 요청은 `search` 필터(키워드·날짜·목록구분·매체·읽음·보관·관심)로 답하고, 기사 ID를 함께 보여줘 후속 `mark`가 가능하게 한다.
-4. 요약·분류·묶기(2단계 스마트 정리)는 아직 CLI에 없다 — 요청받으면 search 결과를 에이전트가 직접 정리하되, 기사에 없는 사실을 추가하지 않는다.
+4. `group`으로 동일보도를 묶고 제목 기반 유형·교육 분야를 자동 분류한다. 이슈 요약은 담당자가 검토·작성하며 기사에 없는 사실을 추가하지 않는다.
 5. 출력은 `export`(md/csv)를 우선 사용하고, 화면 제시용 재구성은 자유.
 
 ## Writing Rules

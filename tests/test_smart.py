@@ -31,8 +31,9 @@ class TestClassify(unittest.TestCase):
     def test_article_type_rules(self):
         cases = [
             ("인천시의회 교육위, 교육청 직속기관 예산 편성 적정성 지적", "비판·점검"),
-            ("[인터뷰] 도성훈 인천시교육감 \"읽걷쓰 AI로 학생성공시대 완성\"", "인터뷰·기획"),
-            ("도성훈 인천교육감, 국회서 무고성 아동학대 신고 관련 법 개정 촉구", "비판·점검"),
+            ("[인터뷰] 도성훈 인천시교육감 \"읽걷쓰 AI로 학생성공시대 완성\"", "교육감"),
+            ("도성훈 인천교육감, 국회서 무고성 아동학대 신고 관련 법 개정 촉구", "교육감"),
+            ("인천시의회, 교육감 공약 이행 미흡 지적", "비판·점검"),
             ("인천교육청, 주민직선 5기 공약 실천계획 발표", "정책·현안"),
             ("인천신트리도서관, 여름방학 어린이 체험프로그램 참가자 모집", "행사·모집"),
             ("월드비전·우리금융·인천교육청, 결식 우려 초등생 조식 지원 협약", "사업·성과"),
@@ -40,6 +41,11 @@ class TestClassify(unittest.TestCase):
         ]
         for title, expected in cases:
             self.assertEqual(newsdb.classify_type(title), expected, msg=title)
+
+    def test_core_issue_type_order_puts_superintendent_first_and_criticism_last(self):
+        core_order = [t for t in newsdb.TYPE_ORDER if t != "타 시도 동향"]
+        self.assertEqual(core_order[0], "교육감")
+        self.assertEqual(core_order[-1], "비판·점검")
 
     def test_edu_fields_multi_tag(self):
         fields = newsdb.classify_fields("인천광역시교육청학생교육원, 학생자치 역량 키우는 리더십 캠프 운영")
@@ -49,6 +55,8 @@ class TestClassify(unittest.TestCase):
         self.assertIn("AI·디지털교육", fields)
         self.assertIn("진로·직업교육", fields)
         self.assertEqual(newsdb.classify_fields("완전히 무관한 제목"), ["기타"])
+        student_fields = newsdb.classify_fields("갑룡초 학생, 전국 발명대회 입상")
+        self.assertIn("학교·학생활동", student_fields)
 
 
 class TestGrouping(unittest.TestCase):

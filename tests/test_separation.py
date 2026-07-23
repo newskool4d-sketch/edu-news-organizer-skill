@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 """인천 vs 타시도·일반교육 분리 테스트 (TDD: 구현 전 작성)."""
 import sys
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -15,12 +16,15 @@ class TestIsIncheon(unittest.TestCase):
         self.assertTrue(newsdb.is_incheon_title("도성훈 교육감, 교육활동 보호 간담회"))
         self.assertTrue(newsdb.is_incheon_title("홍천군, 부평구 어린이 도시문화체험 참가자 모집"))
         self.assertTrue(newsdb.is_incheon_title("옹진군 학생 대상 AI 진로체험 운영"))
+        self.assertTrue(newsdb.is_incheon_title("남동구 중학생 3명, 시민 구조"))
+        self.assertTrue(newsdb.is_incheon_title("청라 학생, 과학대회 우승"))
 
     def test_non_incheon(self):
         self.assertFalse(newsdb.is_incheon_title("제주 수학여행단 8만7000명 돌파"))
         self.assertFalse(newsdb.is_incheon_title("광주중앙도서관, 시민문화강좌 수강생 모집"))
         self.assertFalse(newsdb.is_incheon_title("서이초 3주기…교원 3단체 \"아동학대 법 개정하라\""))
         self.assertFalse(newsdb.is_incheon_title("[오늘의 금융지주] KB금융·우리금융·BNK금융"))
+        self.assertFalse(newsdb.is_incheon_title("쿠팡, 인천 물류센터 화재 판매자 재고 보상"))
 
 
 class TestDigestSeparation(unittest.TestCase):
@@ -81,6 +85,74 @@ class TestDigestSeparation(unittest.TestCase):
         # 타시도 기사가 인천 섹션(전체 기사)에 없어야
         all_section = md.split("타 시도·일반 교육")[0]
         self.assertNotIn("늘봄학교 전국 확대", all_section)
+
+
+class TestDigestSourceBoundary(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.conn = newsdb.open_db(str(Path(self.tmp.name) / "boundary.db"))
+
+    def tearDown(self):
+        self.conn.close()
+        self.tmp.cleanup()
+
+    def test_raw_collector_pool_is_not_published(self):
+        raw = [
+            {"title": "쿠팡, 인천 물류센터 화재 판매자 재고 보상",
+             "publisher": "상업매체", "original_url": "https://a.kr/raw1"},
+            {"title": "전국 학생 대상 공모전 개최",
+             "publisher": "미확인매체", "original_url": "https://a.kr/raw2"},
+        ]
+        newsdb.ingest_articles(
+            self.conn, "2026-07-24", "인천교육", raw,
+            source_kind="collector-json", raw_text="raw"
+        )
+        newsdb.build_groups(self.conn, "2026-07-24")
+        data = newsdb.build_digest_data(self.conn, "2026-07-24")
+        self.assertEqual(data["meta"]["total"], 0)
+        self.assertEqual(data["hero_issues"], [])
+        self.assertEqual(data["all_by_type"], [])
+
+    def test_verified_briefing_wins_and_school_story_stays_incheon(self):
+        selected = [{
+            "title": "갑룡초 학생, 전국 발명대회 입상",
+            "publisher": "지역매체",
+            "original_url": "https://a.kr/selected",
+        }]
+        raw = [
+            {
+                "title": "갑룡초 학생, 전국 발명대회 입상",
+                "publisher": "지역매체",
+                "original_url": "https://a.kr/selected",
+                "relevance_hint": "likely_relevant",
+                "location_hits": ["강화군"],
+            },
+            {
+                "title": "쿠팡, 인천 물류센터 화재 판매자 재고 보상",
+                "publisher": "상업매체",
+                "original_url": "https://a.kr/raw",
+            },
+        ]
+        newsdb.ingest_articles(
+            self.conn, "2026-07-24", "인천교육", raw,
+            source_kind="collector-json", raw_text="raw"
+        )
+        newsdb.ingest_articles(
+            self.conn, "2026-07-24", "인천교육", selected,
+            source_kind="briefing-md", raw_text="briefing"
+        )
+        newsdb.build_groups(self.conn, "2026-07-24")
+        data = newsdb.build_digest_data(self.conn, "2026-07-24")
+        incheon_titles = [r["title"] for _, items in data["all_by_type"] for r in items]
+        other_titles = [r["title"] for r in data["other_articles"]]
+        selected_rows = newsdb.search_articles(
+            self.conn, date="2026-07-24", source_kind="briefing-md"
+        )
+        self.assertEqual(incheon_titles, ["갑룡초 학생, 전국 발명대회 입상"])
+        self.assertEqual(other_titles, [])
+        self.assertEqual(data["meta"]["total"], 1)
+        self.assertEqual(selected_rows[0]["relevance_hint"], "likely_relevant")
+        self.assertEqual(json.loads(selected_rows[0]["location_hits"]), ["강화군"])
 
 
 if __name__ == "__main__":

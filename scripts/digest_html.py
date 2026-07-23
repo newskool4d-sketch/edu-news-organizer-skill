@@ -11,6 +11,7 @@ from datetime import datetime
 
 # 성격 → 강조색 (CI 팔레트 파생)
 TYPE_COLOR = {
+    "교육감": "#004A8A",
     "정책·현안": "#0060B0",
     "비판·점검": "#E2620E",
     "인터뷰·기획": "#0E8FB0",
@@ -229,13 +230,13 @@ def render(data: dict, logo_uri: str = "", public: bool = False,
   }}
   a {{ color:var(--blue); text-decoration:none; }}
   a:hover {{ text-decoration:underline; }}
-  .wrap {{ max-width:1120px; margin:0 auto; padding:0 22px 72px; }}
+  .wrap {{ max-width:1320px; margin:0 auto; padding:0 24px 72px; }}
 
   /* ---- Masthead ---- */
   .masthead {{ position:relative; background:var(--card); border-bottom:1px solid var(--line);
     overflow:hidden; }}
   .flow-band {{ height:7px; background:var(--flow); }}
-  .mast-inner {{ max-width:1120px; margin:0 auto; padding:30px 22px 26px;
+  .mast-inner {{ max-width:1320px; margin:0 auto; padding:30px 24px 26px;
     display:flex; align-items:center; gap:22px; flex-wrap:wrap; }}
   .logo {{ width:60px; height:60px; object-fit:contain; flex:0 0 auto;
     filter:drop-shadow(0 3px 8px rgba(0,74,138,.16)); }}
@@ -264,10 +265,10 @@ def render(data: dict, logo_uri: str = "", public: bool = False,
     padding:2px 10px; border-radius:20px; }}
 
   /* ---- Hero cards ---- */
-  .hero-grid {{ display:grid; grid-template-columns:repeat(auto-fill,minmax(340px,1fr)); gap:16px;
+  .hero-grid {{ display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:16px;
     align-items:start; }}
   .hero-card {{ position:relative; background:var(--card); border:1px solid var(--line);
-    border-radius:16px; padding:20px 20px 18px; overflow:hidden;
+    border-radius:16px; padding:18px 16px 16px; overflow:hidden;
     box-shadow:0 1px 2px rgba(18,35,58,.04); transition:transform .16s ease, box-shadow .16s ease; }}
   .hero-card::before {{ content:""; position:absolute; inset:0 auto 0 0; width:4px; background:var(--accent); }}
   .hero-card:hover {{ transform:translateY(-3px); box-shadow:0 12px 30px rgba(18,35,58,.10); }}
@@ -277,7 +278,7 @@ def render(data: dict, logo_uri: str = "", public: bool = False,
   .field-chips {{ display:flex; gap:5px; flex-wrap:wrap; }}
   .chip {{ font-size:11px; font-weight:600; color:var(--ink-soft); background:var(--line-soft);
     padding:3px 9px; border-radius:20px; }}
-  .hero-title {{ margin:0 0 10px; font-size:19px; font-weight:800; line-height:1.34; letter-spacing:-.02em; }}
+  .hero-title {{ margin:0 0 10px; font-size:17px; font-weight:800; line-height:1.4; letter-spacing:-.02em; }}
   .hero-summary {{ margin:0 0 14px; font-size:14px; color:var(--ink-soft); line-height:1.62;
     padding-left:12px; border-left:2px solid var(--line); }}
   .hero-count {{ display:flex; align-items:center; gap:10px; margin-bottom:14px; }}
@@ -287,7 +288,7 @@ def render(data: dict, logo_uri: str = "", public: bool = False,
   .hero-rep {{ display:flex; gap:9px; padding-top:13px; border-top:1px dashed var(--line); }}
   .rep-label {{ flex:0 0 auto; font-size:11px; font-weight:800; color:var(--faint); padding-top:2px; }}
   .rep-body {{ display:flex; flex-direction:column; gap:2px; }}
-  .rep-body a {{ font-size:14.5px; font-weight:700; line-height:1.4; }}
+  .rep-body a {{ font-size:13.5px; font-weight:700; line-height:1.45; }}
   .rep-pub {{ font-size:12px; color:var(--muted); font-weight:600; }}
   .related {{ display:flex; align-items:center; gap:7px; margin-top:12px; flex-wrap:wrap; }}
   .related-label {{ font-size:11px; font-weight:800; color:var(--faint); }}
@@ -313,8 +314,8 @@ def render(data: dict, logo_uri: str = "", public: bool = False,
     padding:7px 11px; border-radius:9px; }}
 
   /* ---- All articles ---- */
-  .all-grid {{ display:grid; grid-template-columns:repeat(auto-fill,minmax(330px,1fr)); gap:14px 26px; }}
-  .type-block {{ background:var(--card); border:1px solid var(--line); border-radius:14px; padding:16px 18px; }}
+  .all-grid {{ display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:14px 18px; }}
+  .type-block {{ background:var(--card); border:1px solid var(--line); border-radius:14px; padding:15px 14px; }}
   .type-head {{ display:flex; align-items:center; gap:8px; margin:0 0 10px; font-size:15px; font-weight:800; }}
   .type-dot {{ width:9px; height:9px; border-radius:50%; }}
   .type-num {{ margin-left:auto; font-size:12px; font-weight:800; color:var(--muted);
@@ -323,7 +324,7 @@ def render(data: dict, logo_uri: str = "", public: bool = False,
   .row {{ display:flex; align-items:baseline; gap:10px; padding:7px 0; border-top:1px solid var(--line-soft); }}
   .row:first-child {{ border-top:0; }}
   .row-title {{ flex:1; }}
-  .row-title a {{ font-size:14px; font-weight:600; color:var(--ink-soft); line-height:1.45; }}
+  .row-title a {{ font-size:13.5px; font-weight:600; color:var(--ink-soft); line-height:1.48; }}
   .row-title a:hover {{ color:var(--blue); }}
   .row-pub {{ flex:0 0 auto; font-size:11.5px; color:var(--faint); font-weight:600; }}
 
@@ -356,12 +357,36 @@ def render(data: dict, logo_uri: str = "", public: bool = False,
   .disclaimer b {{ color:var(--orange); }}
 
   /* ---- Responsive ---- */
+  @media (max-width:1100px) {{
+    .hero-grid, .all-grid {{ grid-template-columns:repeat(2,minmax(0,1fr)); }}
+  }}
   @media (max-width:720px) {{
-    .mast-inner {{ gap:16px; }}
+    body {{ overflow-x:hidden; }}
+    .wrap {{ padding:0 14px 52px; }}
+    .mast-inner {{ display:grid; grid-template-columns:50px minmax(0,1fr);
+      padding:22px 14px 20px; gap:14px; }}
+    .logo {{ grid-column:1; width:50px; height:50px; }}
+    .mast-text {{ grid-column:2; min-width:0; }}
     .mast-title {{ font-size:23px; }}
-    .stat-strip {{ width:100%; justify-content:space-between; }}
-    .stat {{ flex:1; min-width:0; }}
-    .hero-grid, .all-grid {{ grid-template-columns:1fr; }}
+    .mast-title-img {{ height:31px; }}
+    .slogan-img {{ height:20px; }}
+    .stat-strip {{ grid-column:1 / -1; display:grid;
+      grid-template-columns:repeat(auto-fit,minmax(80px,1fr)); min-width:0;
+      width:100%; gap:8px; }}
+    .stat {{ min-width:0; padding:10px 7px; }}
+    .stat-num {{ font-size:21px; }}
+    .section {{ width:100%; min-width:0; margin-top:32px; }}
+    .sec-head {{ flex-wrap:wrap; gap:8px; margin-bottom:14px; }}
+    .sec-head h2 {{ font-size:19px; }}
+    .hero-grid, .all-grid {{ width:100%; min-width:0; grid-template-columns:1fr; }}
+    .hero-card, .type-block {{ min-width:0; }}
+    .hero-title {{ font-size:16.5px; }}
+    .hero-rep {{ flex-direction:column; gap:4px; }}
+    .rep-body, .row-title {{ min-width:0; }}
+    .hero-title, .rep-body a, .row-title a {{ overflow-wrap:anywhere; }}
+    .row {{ align-items:flex-start; flex-direction:column; gap:2px; }}
+    .row-pub {{ font-size:11px; }}
+    .section-other .other-panel {{ padding:8px 14px; }}
   }}
   /* ---- Print ---- */
   @media print {{

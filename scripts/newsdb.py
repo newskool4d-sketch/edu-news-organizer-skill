@@ -61,7 +61,7 @@ def title_similarity(a: str, b: str) -> float:
     return difflib.SequenceMatcher(None, normalize_title(a), normalize_title(b)).ratio()
 
 
-# 기사 성격 규칙 — 위에서부터 첫 일치 적용 (계획서 Ⅳ-4장 7유형)
+# 기사 성격 규칙 — 위에서부터 첫 일치 적용 (기본 유형 + 교육감 우선 유형)
 OTHER_REGIONS = ["서울", "부산", "대구", "광주", "대전", "울산", "세종", "경기", "강원",
                  "충북", "충남", "전북", "전남", "경북", "경남", "제주"]
 TYPE_RULES = [
@@ -77,10 +77,19 @@ TYPE_RULES = [
 ]
 
 
+def is_superintendent_lead(title: str) -> bool:
+    """제목의 첫 주체가 인천교육감인 기사인지 판별한다. 단순 언급 기사는 제외한다."""
+    lead = re.sub(r"^\s*(?:\[[^\]]+\]\s*)+", "", title or "").strip()
+    subject = re.split(r'[,，:：\"“”]|…', lead, maxsplit=1)[0]
+    return "도성훈" in subject or ("교육감" in subject and "인천" in subject)
+
+
 def classify_type(title: str) -> str:
     if "인천" not in title and ("교육청" in title or "교육감" in title):
         if any(r in title for r in OTHER_REGIONS):
             return "타 시도 동향"
+    if is_superintendent_lead(title):
+        return "교육감"
     for type_name, keywords in TYPE_RULES:
         if any(k in title for k in keywords):
             return type_name
@@ -89,6 +98,8 @@ def classify_type(title: str) -> str:
 
 # 교육 분야 규칙 — 복수 태그 (계획서 Ⅳ-5장 14분야)
 FIELD_RULES = [
+    ("학교·학생활동", ["학교", "학생", "초등생", "중학생", "고등학생", "고교생",
+                    "학부모", "어린이", "청소년"]),
     ("교권·교원정책", ["교권", "교원", "교사", "아동학대", "교육활동 보호", "교장", "교감"]),
     ("학생안전·생활교육", ["안전", "학교폭력", "생활교육", "재해", "폭염", "호우", "흡연", "중독"]),
     ("진로·직업교육", ["진로", "직업", "취업", "도제", "직업계고"]),
@@ -110,6 +121,18 @@ def classify_fields(title: str) -> list:
     return fields or ["기타"]
 
 
+DIGEST_SOURCE_PRIORITY = ("briefing-md", "paste")
+
+
+def preferred_digest_source_kind(conn, batch_date: str) -> str:
+    """공개 다이제스트에 사용할 검증된 입력 종류. 원시 collector JSON은 제외한다."""
+    kinds = {r["source_kind"] for r in conn.execute(
+        "SELECT DISTINCT source_kind FROM source_batches WHERE batch_date = ?",
+        (batch_date,)
+    ).fetchall()}
+    return next((kind for kind in DIGEST_SOURCE_PRIORITY if kind in kinds), "")
+
+
 def build_groups(conn, batch_date: str) -> int:
     """같은 날짜 기사 중 유사 제목을 묶어 article_groups에 저장. 재실행 시 해당 날짜 그룹 재생성.
 
@@ -125,9 +148,20 @@ def build_groups(conn, batch_date: str) -> int:
         conn.execute(f"DELETE FROM article_group_items WHERE group_id IN ({marks})", old)
         conn.execute(f"DELETE FROM article_groups WHERE group_id IN ({marks})", old)
 
-    rows = conn.execute(
-        "SELECT article_id, title, published_at, input_order FROM articles "
-        "WHERE batch_date = ? ORDER BY article_id", (batch_date,)).fetchall()
+    digest_kind = preferred_digest_source_kind(conn, batch_date)
+    if digest_kind:
+        rows = conn.execute(
+            "SELECT a.article_id, a.title, a.published_at, a.input_order FROM articles a "
+            "JOIN source_batches sb ON sb.batch_id = a.batch_id "
+            "WHERE a.batch_date = ? AND sb.source_kind = ? ORDER BY a.article_id",
+            (batch_date, digest_kind)).fetchall()
+    else:
+        kinds = {r["source_kind"] for r in conn.execute(
+            "SELECT DISTINCT source_kind FROM source_batches WHERE batch_date = ?",
+            (batch_date,)).fetchall()}
+        rows = [] if kinds == {"collector-json"} else conn.execute(
+            "SELECT article_id, title, published_at, input_order FROM articles "
+            "WHERE batch_date = ? ORDER BY article_id", (batch_date,)).fetchall()
 
     # union-find로 유사 쌍 병합
     parent = {r["article_id"]: r["article_id"] for r in rows}
@@ -254,6 +288,12 @@ def parse_collected_json(text: str):
             "published_at": a.get("published_at_kst", ""),
             "engine": a.get("engine", ""),
             "queries": ",".join(a.get("queries", [])),
+            "relevance_hint": a.get("relevance_hint", ""),
+            "relevance_reasons": a.get("relevance_reasons", []),
+            "location_hits": a.get("location_hits", []),
+            "education_subject_hits": a.get("education_subject_hits", []),
+            "student_story_hits": a.get("student_story_hits", []),
+            "negative_context_hits": a.get("negative_context_hits", []),
         })
     return batch_date, "인천교육", articles
 
@@ -284,6 +324,12 @@ CREATE TABLE IF NOT EXISTS articles (
     body_status TEXT DEFAULT '본문 미수집',
     engine TEXT DEFAULT '',
     queries TEXT DEFAULT '',
+    relevance_hint TEXT DEFAULT '',
+    relevance_reasons TEXT DEFAULT '[]',
+    location_hits TEXT DEFAULT '[]',
+    education_subject_hits TEXT DEFAULT '[]',
+    student_story_hits TEXT DEFAULT '[]',
+    negative_context_hits TEXT DEFAULT '[]',
     input_order INTEGER DEFAULT 0,
     collected_at TEXT NOT NULL
 );
@@ -353,12 +399,30 @@ def open_db(db_path: str = None) -> sqlite3.Connection:
         conn.execute("ALTER TABLE articles ADD COLUMN article_type TEXT DEFAULT ''")
     if "edu_fields" not in cols:
         conn.execute("ALTER TABLE articles ADD COLUMN edu_fields TEXT DEFAULT ''")
+    metadata_columns = {
+        "relevance_hint": "TEXT DEFAULT ''",
+        "relevance_reasons": "TEXT DEFAULT '[]'",
+        "location_hits": "TEXT DEFAULT '[]'",
+        "education_subject_hits": "TEXT DEFAULT '[]'",
+        "student_story_hits": "TEXT DEFAULT '[]'",
+        "negative_context_hits": "TEXT DEFAULT '[]'",
+    }
+    for name, definition in metadata_columns.items():
+        if name not in cols:
+            conn.execute(f"ALTER TABLE articles ADD COLUMN {name} {definition}")
     conn.commit()
     return conn
 
 
 def _now() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _json_list(value) -> str:
+    """수집기 메타데이터 배열을 DB에 보존 가능한 JSON 문자열로 정규화한다."""
+    if isinstance(value, str):
+        return value
+    return json.dumps(value if isinstance(value, list) else [], ensure_ascii=False)
 
 
 def ingest_articles(conn, batch_date, list_type, articles, source_kind, raw_text):
@@ -376,18 +440,44 @@ def ingest_articles(conn, batch_date, list_type, articles, source_kind, raw_text
         title = a.get("title", "")
         cur = conn.execute(
             "INSERT OR IGNORE INTO articles(batch_id, batch_date, list_type, title, publisher, "
-            "publisher_domain, original_url, clean_url, published_at, engine, queries, input_order, "
-            "collected_at, article_type, edu_fields) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "publisher_domain, original_url, clean_url, published_at, engine, queries, "
+            "relevance_hint, relevance_reasons, location_hits, education_subject_hits, "
+            "student_story_hits, negative_context_hits, input_order, collected_at, article_type, edu_fields) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (batch_id, batch_date, list_type, title, a.get("publisher", ""),
              a.get("publisher_domain", "") or urllib.parse.urlsplit(url).netloc,
              url, clean_url(url), a.get("published_at", ""), a.get("engine", ""),
-             a.get("queries", ""), order, _now(),
+             a.get("queries", ""), a.get("relevance_hint", ""),
+             _json_list(a.get("relevance_reasons")), _json_list(a.get("location_hits")),
+             _json_list(a.get("education_subject_hits")), _json_list(a.get("student_story_hits")),
+             _json_list(a.get("negative_context_hits")), order, _now(),
              classify_type(title), ",".join(classify_fields(title))))
         if cur.rowcount == 1:
             new += 1
         else:
             dup += 1
+            existing = conn.execute(
+                "SELECT a.article_id, sb.source_kind FROM articles a "
+                "JOIN source_batches sb ON sb.batch_id = a.batch_id WHERE a.clean_url = ?",
+                (clean_url(url),)
+            ).fetchone()
+            new_rank = (DIGEST_SOURCE_PRIORITY.index(source_kind)
+                        if source_kind in DIGEST_SOURCE_PRIORITY else len(DIGEST_SOURCE_PRIORITY))
+            old_kind = existing["source_kind"] if existing else ""
+            old_rank = (DIGEST_SOURCE_PRIORITY.index(old_kind)
+                        if old_kind in DIGEST_SOURCE_PRIORITY else len(DIGEST_SOURCE_PRIORITY))
+            if existing and source_kind in DIGEST_SOURCE_PRIORITY and new_rank < old_rank:
+                conn.execute(
+                    "UPDATE articles SET batch_id = ?, batch_date = ?, list_type = ?, title = ?, "
+                    "publisher = ?, publisher_domain = ?, original_url = ?, published_at = ?, "
+                    "engine = ?, queries = ?, input_order = ?, article_type = ?, edu_fields = ? "
+                    "WHERE article_id = ?",
+                    (batch_id, batch_date, list_type, title, a.get("publisher", ""),
+                     a.get("publisher_domain", "") or urllib.parse.urlsplit(url).netloc,
+                     url, a.get("published_at", ""), a.get("engine", ""), a.get("queries", ""),
+                     order, classify_type(title), ",".join(classify_fields(title)),
+                     existing["article_id"])
+                )
     conn.commit()
     return new, dup
 
@@ -433,18 +523,22 @@ def mark_article(conn, article_id, read_status=None, favorite=None, excluded=Non
 def search_articles(conn, q=None, date=None, list_type=None, publisher=None,
                     favorite=None, read_status=None, interest_only=False,
                     include_excluded=False, selected=False, article_type=None,
-                    edu_field=None, limit=100):
+                    edu_field=None, source_kind=None, limit=100):
     """검색 결과를 dict 목록으로 반환. interest_hits는 조회 시점 관심 키워드 대조."""
     sql = ("SELECT a.*, COALESCE(u.read_status, 'unread') AS read_status, "
            "COALESCE(u.favorite, 0) AS favorite, COALESCE(u.excluded, 0) AS excluded, "
-           "COALESCE(u.memo, '') AS memo, COALESCE(u.user_category, '') AS user_category "
-           "FROM articles a LEFT JOIN user_actions u "
-           "ON u.target_type = 'article' AND u.target_id = a.article_id WHERE 1=1")
+           "COALESCE(u.memo, '') AS memo, COALESCE(u.user_category, '') AS user_category, "
+           "sb.source_kind AS source_kind "
+           "FROM articles a JOIN source_batches sb ON sb.batch_id = a.batch_id "
+           "LEFT JOIN user_actions u ON u.target_type = 'article' "
+           "AND u.target_id = a.article_id WHERE 1=1")
     vals = []
     if selected:
         # 선별 기사 = 브리핑 md 배치로 처음 저장된 기사 (풀 전용 후보 제외)
         sql += (" AND a.batch_id IN (SELECT batch_id FROM source_batches "
                 "WHERE source_kind = 'briefing-md')")
+    if source_kind:
+        sql += " AND sb.source_kind = ?"; vals.append(source_kind)
     if article_type:
         sql += " AND a.article_type = ?"; vals.append(article_type)
     if edu_field:
@@ -511,7 +605,8 @@ def export_md(conn, batch_date=None, rows=None) -> str:
     return "\n".join(lines).rstrip() + "\n"
 
 
-TYPE_ORDER = ["정책·현안", "비판·점검", "인터뷰·기획", "사업·성과", "타 시도 동향", "행사·모집", "기타"]
+TYPE_ORDER = ["교육감", "정책·현안", "인터뷰·기획", "사업·성과", "행사·모집", "기타",
+              "비판·점검", "타 시도 동향"]
 
 
 def list_groups(conn, batch_date: str) -> list:
@@ -524,10 +619,11 @@ def list_groups(conn, batch_date: str) -> list:
             "WHERE a.batch_date = ? GROUP BY g.group_id", (batch_date,)).fetchall():
         d = dict(g)
         d["members"] = [dict(r) for r in conn.execute(
-            "SELECT a.article_id, a.title, "
+            "SELECT a.article_id, a.title, a.list_type, sb.source_kind, "
             "COALESCE(NULLIF(a.publisher, ''), a.publisher_domain) AS publisher, "
             "a.original_url FROM article_group_items i "
-            "JOIN articles a ON a.article_id = i.article_id WHERE i.group_id = ? "
+            "JOIN articles a ON a.article_id = i.article_id "
+            "JOIN source_batches sb ON sb.batch_id = a.batch_id WHERE i.group_id = ? "
             "ORDER BY a.published_at", (g["group_id"],)).fetchall()]
         groups.append(d)
     groups.sort(key=lambda g: (TYPE_ORDER.index(g["article_type"]) if g["article_type"] in TYPE_ORDER else 99,
@@ -541,24 +637,53 @@ def set_group_summary(conn, group_id: int, summary: str):
     conn.commit()
 
 
-# 인천 관련성 판별 마커 — 제목 기반 (지역명·교육감·군구·개발지구)
-INCHEON_MARKERS = ["인천", "도성훈", "강화", "옹진", "영종", "검단", "송도",
-                   "부평", "계양", "미추홀", "연수구", "남동구"]
+# 제목 fallback용 인천 관련성 신호. 지역명 단독은 부족하고 교육 주체가 함께 있어야 한다.
+INCHEON_OFFICE_MARKERS = ["인천광역시교육청", "인천시교육청", "인천교육청", "인천교육감", "도성훈"]
+INCHEON_LOCATION_MARKERS = [
+    "인천", "강화군", "옹진군", "제물포구", "영종구", "미추홀구", "연수구",
+    "남동구", "부평구", "계양구", "서해구", "검단구", "송도", "청라", "영종",
+    "검단", "구월", "논현", "석남", "검암", "가정", "주안", "부개", "계산",
+    "운서", "신현", "가좌", "만수",
+]
+EDUCATION_SUBJECT_MARKERS = [
+    "교육청", "교육지원청", "학교", "학생", "초등생", "중학생", "고등학생", "고교생",
+    "교사", "교원", "학부모", "유치원", "어린이", "청소년", "교육", "도서관",
+    "평생학습관", "교육원",
+]
 
 
 def is_incheon_title(title: str) -> bool:
-    """제목에 인천 마커가 있으면 인천교육 뉴스로 본다. 타시도·일반교육(전국) 뉴스와 분리용."""
-    return any(m in title for m in INCHEON_MARKERS)
+    """제목 fallback: 교육청 직접 신호 또는 인천 지역 근거와 교육 주체의 결합을 요구한다."""
+    if any(marker in title for marker in INCHEON_OFFICE_MARKERS):
+        return True
+    has_location = any(marker in title for marker in INCHEON_LOCATION_MARKERS)
+    has_education_subject = any(marker in title for marker in EDUCATION_SUBJECT_MARKERS)
+    return has_location and has_education_subject
+
+
+def is_incheon_article(article: dict) -> bool:
+    """검증된 인천 브리핑은 신뢰하고, 그 밖의 입력은 제목 fallback으로 판별한다."""
+    title = article.get("title", "")
+    if is_incheon_title(title):
+        return True
+    trusted = article.get("source_kind") in DIGEST_SOURCE_PRIORITY and article.get("list_type") == "인천교육"
+    if not trusted:
+        return False
+    stripped = title.lstrip()
+    return not stripped.startswith("교육부") and not any(region in title for region in OTHER_REGIONS)
 
 
 def build_digest_data(conn, batch_date: str) -> dict:
     """다이제스트 공유 데이터 구조. md·html 렌더러가 모두 이 데이터를 소비한다.
 
     인천 뉴스(hero_issues·all_by_type)와 타시도·일반교육 뉴스(other_issues·other_articles)를 분리한다.
-    묶음은 구성 기사 중 한 건이라도 인천 마커가 있으면 인천으로 분류.
+    묶음은 구성 기사 중 한 건이라도 검증된 인천 입력이거나 제목 근거가 있으면 인천으로 분류.
+    원시 collector JSON은 후보 풀이므로 공개 다이제스트에서 제외한다.
     """
-    rows = search_articles(conn, date=batch_date, limit=2000)
-    groups = list_groups(conn, batch_date)
+    digest_kind = preferred_digest_source_kind(conn, batch_date)
+    rows = (search_articles(conn, date=batch_date, source_kind=digest_kind, limit=2000)
+            if digest_kind else [])
+    groups = list_groups(conn, batch_date) if digest_kind else []
     grouped_ids = {m["article_id"] for g in groups for m in g["members"]}
 
     hero_issues, other_issues = [], []
@@ -576,7 +701,7 @@ def build_digest_data(conn, batch_date: str) -> dict:
             "representative": rep,
             "others": others,
         }
-        if any(is_incheon_title(m["title"]) for m in g["members"]):
+        if any(is_incheon_article(m) for m in g["members"]):
             hero_issues.append(issue)
         else:
             other_issues.append(issue)
@@ -584,8 +709,8 @@ def build_digest_data(conn, batch_date: str) -> dict:
     interest_articles = [r for r in rows if r["interest_hits"]]
 
     singles = [r for r in rows if r["article_id"] not in grouped_ids]
-    incheon_singles = [r for r in singles if is_incheon_title(r["title"])]
-    other_articles = [r for r in singles if not is_incheon_title(r["title"])]
+    incheon_singles = [r for r in singles if is_incheon_article(r)]
+    other_articles = [r for r in singles if not is_incheon_article(r)]
     by_type = {}
     for r in incheon_singles:
         by_type.setdefault(r["article_type"] or "기타", []).append(r)

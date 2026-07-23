@@ -181,6 +181,12 @@ class TestParseCollectedJson(unittest.TestCase):
                 "published_at_kst": "2026-07-15 10:00",
                 "queries": ["Q1:인천교육청"],
                 "engine": "google-news-rss",
+                "relevance_hint": "likely_relevant",
+                "relevance_reasons": ["incheon_education_office", "education_subject"],
+                "location_hits": ["인천"],
+                "education_subject_hits": ["학생"],
+                "student_story_hits": ["수상"],
+                "negative_context_hits": [],
             }],
         }
         batch_date, list_type, articles = newsdb.parse_collected_json(json.dumps(payload, ensure_ascii=False))
@@ -189,6 +195,39 @@ class TestParseCollectedJson(unittest.TestCase):
         self.assertEqual(articles[0]["publisher"], "웹이코노미")
         self.assertEqual(articles[0]["published_at"], "2026-07-15 10:00")
         self.assertEqual(articles[0]["engine"], "google-news-rss")
+        self.assertEqual(articles[0]["relevance_hint"], "likely_relevant")
+        self.assertEqual(articles[0]["location_hits"], ["인천"])
+
+
+    def test_relevance_metadata_roundtrip(self):
+        payload = {
+            "window_end": "2026-07-24 05:00",
+            "articles": [{
+                "title": "남동구 중학생 3명, 시민 구조",
+                "publisher": "검증매체",
+                "original_url": "https://a.kr/student",
+                "relevance_hint": "likely_relevant",
+                "relevance_reasons": ["incheon_location", "education_subject"],
+                "location_hits": ["남동구"],
+                "education_subject_hits": ["중학생"],
+                "student_story_hits": ["구조"],
+                "negative_context_hits": [],
+            }],
+        }
+        batch_date, list_type, articles = newsdb.parse_collected_json(
+            json.dumps(payload, ensure_ascii=False)
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            conn = newsdb.open_db(str(Path(tmp) / "metadata.db"))
+            newsdb.ingest_articles(
+                conn, batch_date, list_type, articles,
+                source_kind="collector-json", raw_text="raw"
+            )
+            row = newsdb.search_articles(conn, q="중학생")[0]
+            self.assertEqual(row["relevance_hint"], "likely_relevant")
+            self.assertEqual(json.loads(row["location_hits"]), ["남동구"])
+            self.assertEqual(json.loads(row["student_story_hits"]), ["구조"])
+            conn.close()
 
 
 if __name__ == "__main__":
