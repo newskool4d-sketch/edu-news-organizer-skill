@@ -24,7 +24,9 @@ class TestIsIncheon(unittest.TestCase):
         self.assertFalse(newsdb.is_incheon_title("광주중앙도서관, 시민문화강좌 수강생 모집"))
         self.assertFalse(newsdb.is_incheon_title("서이초 3주기…교원 3단체 \"아동학대 법 개정하라\""))
         self.assertFalse(newsdb.is_incheon_title("[오늘의 금융지주] KB금융·우리금융·BNK금융"))
-        self.assertFalse(newsdb.is_incheon_title("쿠팡, 인천 물류센터 화재 판매자 재고 보상"))
+
+    def test_legacy_incheon_candidate_marker_is_preserved(self):
+        self.assertTrue(newsdb.is_incheon_title("쿠팡, 인천 물류센터 화재 판매자 재고 보상"))
 
 
 class TestDigestSeparation(unittest.TestCase):
@@ -87,7 +89,7 @@ class TestDigestSeparation(unittest.TestCase):
         self.assertNotIn("늘봄학교 전국 확대", all_section)
 
 
-class TestDigestSourceBoundary(unittest.TestCase):
+class TestDigestSourcePreservation(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.conn = newsdb.open_db(str(Path(self.tmp.name) / "boundary.db"))
@@ -96,7 +98,7 @@ class TestDigestSourceBoundary(unittest.TestCase):
         self.conn.close()
         self.tmp.cleanup()
 
-    def test_raw_collector_pool_is_not_published(self):
+    def test_raw_collector_pool_remains_in_full_article_set(self):
         raw = [
             {"title": "쿠팡, 인천 물류센터 화재 판매자 재고 보상",
              "publisher": "상업매체", "original_url": "https://a.kr/raw1"},
@@ -109,11 +111,13 @@ class TestDigestSourceBoundary(unittest.TestCase):
         )
         newsdb.build_groups(self.conn, "2026-07-24")
         data = newsdb.build_digest_data(self.conn, "2026-07-24")
-        self.assertEqual(data["meta"]["total"], 0)
-        self.assertEqual(data["hero_issues"], [])
-        self.assertEqual(data["all_by_type"], [])
+        incheon_titles = [r["title"] for _, items in data["all_by_type"] for r in items]
+        other_titles = [r["title"] for r in data["other_articles"]]
+        self.assertEqual(data["meta"]["total"], 2)
+        self.assertIn("쿠팡, 인천 물류센터 화재 판매자 재고 보상", incheon_titles)
+        self.assertIn("전국 학생 대상 공모전 개최", other_titles)
 
-    def test_verified_briefing_wins_and_school_story_stays_incheon(self):
+    def test_briefing_marks_selected_without_removing_pool_only_articles(self):
         selected = [{
             "title": "갑룡초 학생, 전국 발명대회 입상",
             "publisher": "지역매체",
@@ -148,9 +152,15 @@ class TestDigestSourceBoundary(unittest.TestCase):
         selected_rows = newsdb.search_articles(
             self.conn, date="2026-07-24", source_kind="briefing-md"
         )
-        self.assertEqual(incheon_titles, ["갑룡초 학생, 전국 발명대회 입상"])
+        self.assertCountEqual(
+            incheon_titles,
+            [
+                "갑룡초 학생, 전국 발명대회 입상",
+                "쿠팡, 인천 물류센터 화재 판매자 재고 보상",
+            ],
+        )
         self.assertEqual(other_titles, [])
-        self.assertEqual(data["meta"]["total"], 1)
+        self.assertEqual(data["meta"]["total"], 2)
         self.assertEqual(selected_rows[0]["relevance_hint"], "likely_relevant")
         self.assertEqual(json.loads(selected_rows[0]["location_hits"]), ["강화군"])
 

@@ -126,15 +126,6 @@ def classify_fields(title: str) -> list:
 DIGEST_SOURCE_PRIORITY = ("briefing-md", "paste")
 
 
-def preferred_digest_source_kind(conn, batch_date: str) -> str:
-    """공개 다이제스트에 사용할 검증된 입력 종류. 원시 collector JSON은 제외한다."""
-    kinds = {r["source_kind"] for r in conn.execute(
-        "SELECT DISTINCT source_kind FROM source_batches WHERE batch_date = ?",
-        (batch_date,)
-    ).fetchall()}
-    return next((kind for kind in DIGEST_SOURCE_PRIORITY if kind in kinds), "")
-
-
 def build_groups(conn, batch_date: str) -> int:
     """같은 날짜 기사 중 유사 제목을 묶어 article_groups에 저장. 재실행 시 해당 날짜 그룹 재생성.
 
@@ -150,20 +141,9 @@ def build_groups(conn, batch_date: str) -> int:
         conn.execute(f"DELETE FROM article_group_items WHERE group_id IN ({marks})", old)
         conn.execute(f"DELETE FROM article_groups WHERE group_id IN ({marks})", old)
 
-    digest_kind = preferred_digest_source_kind(conn, batch_date)
-    if digest_kind:
-        rows = conn.execute(
-            "SELECT a.article_id, a.title, a.published_at, a.input_order FROM articles a "
-            "JOIN source_batches sb ON sb.batch_id = a.batch_id "
-            "WHERE a.batch_date = ? AND sb.source_kind = ? ORDER BY a.article_id",
-            (batch_date, digest_kind)).fetchall()
-    else:
-        kinds = {r["source_kind"] for r in conn.execute(
-            "SELECT DISTINCT source_kind FROM source_batches WHERE batch_date = ?",
-            (batch_date,)).fetchall()}
-        rows = [] if kinds == {"collector-json"} else conn.execute(
-            "SELECT article_id, title, published_at, input_order FROM articles "
-            "WHERE batch_date = ? ORDER BY article_id", (batch_date,)).fetchall()
+    rows = conn.execute(
+        "SELECT article_id, title, published_at, input_order FROM articles "
+        "WHERE batch_date = ? ORDER BY article_id", (batch_date,)).fetchall()
 
     # union-find로 유사 쌍 병합
     parent = {r["article_id"]: r["article_id"] for r in rows}
@@ -656,28 +636,17 @@ def set_group_summary(conn, group_id: int, summary: str):
     conn.commit()
 
 
-# 제목 fallback용 인천 관련성 신호. 지역명 단독은 부족하고 교육 주체가 함께 있어야 한다.
-INCHEON_OFFICE_MARKERS = ["인천광역시교육청", "인천시교육청", "인천교육청", "인천교육감", "도성훈"]
-INCHEON_LOCATION_MARKERS = [
-    "인천", "강화군", "옹진군", "제물포구", "영종구", "미추홀구", "연수구",
-    "남동구", "부평구", "계양구", "서해구", "검단구", "송도", "청라", "영종",
-    "검단", "구월", "논현", "석남", "검암", "가정", "주안", "부개", "계산",
-    "운서", "신현", "가좌", "만수",
-]
-EDUCATION_SUBJECT_MARKERS = [
-    "교육청", "교육지원청", "학교", "학생", "초등생", "중학생", "고등학생", "고교생",
-    "교사", "교원", "학부모", "유치원", "어린이", "청소년", "교육", "도서관",
-    "평생학습관", "교육원",
+# 7/23 방식의 폭넓은 인천 후보 판정 마커.
+# 관련성 힌트는 최종 브리핑 선별에 쓰되, organizer의 전체 기사 집합을 축소하지 않는다.
+INCHEON_MARKERS = [
+    "인천", "도성훈", "강화", "옹진", "영종", "검단", "송도", "청라",
+    "제물포", "서해구", "부평", "계양", "미추홀", "연수구", "남동구",
 ]
 
 
 def is_incheon_title(title: str) -> bool:
-    """제목 fallback: 교육청 직접 신호 또는 인천 지역 근거와 교육 주체의 결합을 요구한다."""
-    if any(marker in title for marker in INCHEON_OFFICE_MARKERS):
-        return True
-    has_location = any(marker in title for marker in INCHEON_LOCATION_MARKERS)
-    has_education_subject = any(marker in title for marker in EDUCATION_SUBJECT_MARKERS)
-    return has_location and has_education_subject
+    """7/23 방식: 제목에 인천 마커가 있으면 인천 후보로 유지한다."""
+    return any(marker in title for marker in INCHEON_MARKERS)
 
 
 def is_incheon_article(article: dict) -> bool:
@@ -697,12 +666,10 @@ def build_digest_data(conn, batch_date: str) -> dict:
 
     인천 뉴스(hero_issues·all_by_type)와 타시도·일반교육 뉴스(other_issues·other_articles)를 분리한다.
     묶음은 구성 기사 중 한 건이라도 검증된 인천 입력이거나 제목 근거가 있으면 인천으로 분류.
-    원시 collector JSON은 후보 풀이므로 공개 다이제스트에서 제외한다.
+    기사 집합은 7/23 방식대로 전체 수집 후보를 유지하고 TYPE_ORDER로 제시 순서만 조정한다.
     """
-    digest_kind = preferred_digest_source_kind(conn, batch_date)
-    rows = (search_articles(conn, date=batch_date, source_kind=digest_kind, limit=2000)
-            if digest_kind else [])
-    groups = list_groups(conn, batch_date) if digest_kind else []
+    rows = search_articles(conn, date=batch_date, limit=2000)
+    groups = list_groups(conn, batch_date)
     grouped_ids = {m["article_id"] for g in groups for m in g["members"]}
 
     hero_issues, other_issues = [], []
