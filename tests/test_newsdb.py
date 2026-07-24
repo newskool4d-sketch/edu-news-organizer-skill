@@ -55,6 +55,23 @@ https://www.kihoilbo.co.kr/news/articleView.html?idxno=3028964
         self.assertEqual(articles[0]["original_url"], "https://www.kyeongin.com/article/1767324")
         self.assertEqual(articles[1]["publisher"], "기호일보")
 
+    def test_extracts_section_date_format_used_by_daily_runner(self):
+        text = """# 인천교육청 언론보도 현황
+
+## 보도일
+2026. 7. 24.(금)
+
+## 주요 언론보도
+
+■ 인천북부교육지원청, 교육복지 학생 대상 여름방학 멘토링 - 뉴스타운
+https://newstown.co.kr/news/articleView.html?idxno=710131
+"""
+        batch_date, list_type, articles = newsdb.parse_briefing_md(text)
+        self.assertEqual(batch_date, "2026-07-24")
+        self.assertEqual(list_type, "인천교육")
+        self.assertEqual(len(articles), 1)
+        self.assertEqual(articles[0]["publisher"], "뉴스타운")
+
 
 class TestParsePaste(unittest.TestCase):
     SAMPLE = """2026. 7. 16.(목) 시·도교육청 및 교육부 주요 언론보도 현황입니다.

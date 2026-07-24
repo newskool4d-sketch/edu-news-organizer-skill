@@ -25,6 +25,8 @@ TRACKING_PARAMS = {"utm_source", "utm_medium", "utm_campaign", "utm_term", "utm_
 
 DATE_HEADER_RE = re.compile(
     r"^(20\d{2})\.\s*(\d{1,2})\.\s*(\d{1,2})\.\s*\(.\)\s*(.+?)\s*주요 언론보도 현황입니다")
+DATE_ONLY_RE = re.compile(
+    r"^(20\d{2})\.\s*(\d{1,2})\.\s*(\d{1,2})\.\s*\([^)]*\)\s*$")
 ARTICLE_LINE_RE = re.compile(r"^■\s+(.+)$")
 
 
@@ -218,6 +220,11 @@ def _header_to_batch(m: re.Match):
     return batch_date, list_type
 
 
+def _date_only_to_batch(m: re.Match):
+    """`## 보도일` 아래의 날짜 단독 표기 → 인천교육 배치 날짜."""
+    return f"{m.group(1)}-{int(m.group(2)):02d}-{int(m.group(3)):02d}", "인천교육"
+
+
 def _parse_share_lines(lines: list) -> list:
     """`■ 제목 - 매체` 다음 줄 URL 형식의 기사 목록을 파싱한다."""
     articles = []
@@ -244,12 +251,24 @@ def _parse_share_lines(lines: list) -> list:
 def parse_briefing_md(text: str):
     """daily-news-picker 일일 브리핑 md → (batch_date, list_type, articles)."""
     batch_date, list_type = None, "인천교육"
-    for line in text.splitlines():
+    lines = text.splitlines()
+    for line in lines:
         m = DATE_HEADER_RE.match(line.strip())
         if m:
             batch_date, list_type = _header_to_batch(m)
             break
-    articles = _parse_share_lines(text.splitlines())
+    if not batch_date:
+        for index, line in enumerate(lines):
+            if line.strip() != "## 보도일":
+                continue
+            for candidate in lines[index + 1:index + 4]:
+                m = DATE_ONLY_RE.match(candidate.strip())
+                if m:
+                    batch_date, list_type = _date_only_to_batch(m)
+                    break
+            if batch_date:
+                break
+    articles = _parse_share_lines(lines)
     return batch_date, list_type, articles
 
 
