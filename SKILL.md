@@ -61,17 +61,21 @@ python scripts/publish_site.py --site-dir <site폴더> --date 2026-07-16 --push 
 [references/deploy-vercel.md](./references/deploy-vercel.md). **웹 배포본은 개인 데이터(내 관심업무·메모)를
 제외한 공개 안전본**이며 "비공식·개인 정리용" 표기가 붙는다. 전체 개인 버전은 로컬 전용.
 
+공개 방식의 잠금 정본은 [references/publication-contract.json](./references/publication-contract.json)이다.
+입력 순서·후보 게시 경계·데이터가 있는 최대 3단 섹션의 순서·반응형 열·기사 유형 순서가 이 JSON과 다르면
+`publish_site.py`가 생성을 중단한다. JSON 또는 템플릿 변경은 사용자 명시 승인 없이는 금지한다.
+
 - DB 위치: `%USERPROFILE%\Documents\Codex\EduNewsOrganizer\news.db` (환경변수 `EDU_NEWS_DB_PATH` 또는 `--db`로 변경)
 - 원본 목록(raw_text)은 source_batches에 그대로 보존한다 (기본 원칙: 원본 보존)
-- 상류 JSON의 `relevance_hint`·판정 근거·위치/교육주체/학생활동 히트는 기사 단위로 보존하되, 최종 포함 판단으로 사용하지 않는다.
+- 상류 JSON의 `relevance_hint`·판정 근거·위치/교육주체/학생활동 히트는 기사 단위로 보존한다. 후보 자체는 삭제하지 않는다. 공개 묶음·다이제스트에는 `likely_relevant`·`needs_review` 후보와 브리핑 명시 기사의 합집합을 사용해 기존 동일보도 묶음 구조를 유지한다.
 - 관심도 표시는 저장 시점이 아니라 조회 시점에 interests 테이블과 대조한다 (키워드 변경 즉시 반영)
 
 ## Workflow
 
-1. 7/23 운영 방식대로 검증 완료 `briefing-md`를 먼저 넣고 상류 `collector-json` 후보 풀도 이어서 보관·정리한다. `briefing-md`는 선별 기사 표시 기준으로 사용하고, 전체 기사 집합은 유지한 채 유형 우선순위로 제시 순서만 조정한다.
+1. 이전 승인 흐름대로 검증 완료 `briefing-md`를 먼저 넣고 `collector-json` 후보 풀을 이어서 넣는다. 같은 URL이 다른 날짜에 다시 등장해도 각 날짜 관계를 보존한다. 후보 전체는 검색·검토용으로 유지하되, 공개본은 브리핑 명시 기사와 allow-list인 `likely_relevant`·`needs_review` 후보만 기존 방식으로 묶어 싣는다.
 2. `ingest` 실행 후 신규/중복 건수를 사용자에게 보고한다. 중복은 clean_url 기준이며 조용히 버리지 않고 건수로 알린다.
 3. 조회 요청은 `search` 필터(키워드·날짜·목록구분·매체·읽음·보관·관심)로 답하고, 기사 ID를 함께 보여줘 후속 `mark`가 가능하게 한다.
-4. `group`으로 동일보도를 묶고 제목 기반 유형·교육 분야를 자동 분류한다. 이슈 요약은 담당자가 검토·작성하며 기사에 없는 사실을 추가하지 않는다.
+4. `group`으로 선별된 기사끼리만 동일보도를 묶고 제목 기반 유형·교육 분야를 자동 분류한다. 이슈 요약은 담당자가 검토·작성하며 기사에 없는 사실을 추가하지 않는다.
 5. 출력은 `export`(md/csv)를 우선 사용하고, 화면 제시용 재구성은 자유.
 
 ## Writing Rules

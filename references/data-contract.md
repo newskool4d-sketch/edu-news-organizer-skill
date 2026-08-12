@@ -3,7 +3,7 @@
 > 2026-07-17 작성, 2026-07-23 학교·학생 관련성 메타데이터 반영. 상류 정본: `~/.codex/skills/daily-news-picker/` (repo: daily-news-picker-skill)
 > 이 스킬은 수집을 하지 않는다 — 아래 3종 입력을 받아 저장·정리만 수행한다.
 
-## 1. collected_articles.json (가장 정밀 — 우선 사용)
+## 1. collected_articles.json (후보 원본 — 먼저 저장)
 
 상류 `scripts/collect_news_rss.py` 산출물. 러너 실행 시 Codex 작업 폴더
 (`%TEMP%\DailyNewsPickerCodexWork\current\collected_articles.json`)에도 생성된다.
@@ -58,10 +58,15 @@ URL
 
 ## 공통 규칙
 
-- 기사 집합 유지: 7/23 운영 방식대로 `briefing-md`를 먼저 저장하고 `collector-json` 후보 풀도 이어서
-  보관·정리한다. 입력 종류는 선별 기사 표시와 추적에 사용하며 전체 기사 집합을 축소하지 않는다.
-- 관련성 메타데이터: `relevance_hint`와 근거 배열은 최종 브리핑 선별을 돕는 정보이며, organizer에서는
-  후보 삭제 조건으로 사용하지 않는다. 다이제스트는 전체 기사 집합을 유지하고 유형 우선순위로 제시한다.
+- 후보·선별 분리: 기존 게시 흐름대로 `briefing-md` 또는 본청 `paste`를 먼저 저장하고,
+  `collector-json`을 이어서 저장해 후보 원본과 관련성 메타데이터를 보존한다.
+  날짜별 `article_selections`에는 브리핑 명시 기사와 allow-list인 `likely_relevant`·`needs_review` 후보를 기록한다.
+  같은 `clean_url`이 다른 날짜 선별본에 다시 등장해도 해당 날짜 관계와 입력 순서를 별도로 보존한다.
+- 후보 보존: `likely_irrelevant` 항목도 삭제하지 않고 내부 검색·검토용 DB에 보존한다.
+  공개 묶음·다이제스트에서는 이 항목만 제외하며, 나머지는 데이터가 있는 공개 섹션을 승인된 상대 순서로 게시한다.
+- 관련성 메타데이터: `relevance_hint`와 근거 배열은 상류 선별을 돕는 정보다. organizer는 이를
+  임의로 최종 판정하지 않고 상류 선별 결과를 명시적 상태로 소비한다.
+- 표시 순서: `교육감 → 정책·현안 → 인터뷰·기획 → 사업·성과 → 행사·모집 → 기타 → 비판·점검 → 타 시도 동향`을 유지한다.
 - 중복 판정: `clean_url`(추적 파라미터 제거 후 URL) UNIQUE. 같은 기사의 모바일/AMP URL 변형은
   현 단계에서 별개로 저장된다 (실측: 브리핑 38건 중 37건 중복 감지, 1건 URL 변형 통과) —
   2단계 동일보도 묶기에서 처리 예정.

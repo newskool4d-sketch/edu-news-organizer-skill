@@ -16,6 +16,7 @@ site/
 """
 import argparse
 import html as _html
+import json
 import re
 import subprocess
 import sys
@@ -29,6 +30,7 @@ if sys.stdout is not None and hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
 
 DATE_RE = re.compile(r"^(20\d{2}-\d{2}-\d{2})\.html$")
+CONTRACT_PATH = Path(__file__).resolve().parents[1] / "references" / "publication-contract.json"
 NAV_STYLE_RE = re.compile(
     r"\s*/\* EDU_NEWS_SITE_NAV_START \*/.*?/\* EDU_NEWS_SITE_NAV_END \*/\s*",
     re.DOTALL,
@@ -41,6 +43,69 @@ NAV_HTML_RE = re.compile(
 
 def esc(s) -> str:
     return _html.escape(str(s if s is not None else ""), quote=True)
+
+
+def load_publication_contract(path: Path = CONTRACT_PATH) -> dict:
+    """승인된 공개 구조 계약을 읽는다. 누락·잠금 해제 상태면 게시를 중단한다."""
+    contract = json.loads(path.read_text(encoding="utf-8"))
+    if not contract.get("locked"):
+        raise ValueError("공개 구조 계약이 잠금 상태가 아닙니다.")
+    return contract
+
+
+def validate_ingestion_contract(conn, date_iso: str, contract: dict) -> None:
+    """해당 날짜의 최신 입력 순서가 briefing → collector인지 확인한다."""
+    expected = contract["ingestion"]["order"]
+    if expected != ["briefing-md", "collector-json"]:
+        raise ValueError(f"지원하지 않는 입력 순서 계약입니다: {expected}")
+    publishable_statuses = frozenset(
+        contract["ingestion"]["publish_candidate_statuses"]
+    )
+    if publishable_statuses != newsdb.PUBLISHABLE_CANDIDATE_STATUSES:
+        raise ValueError(
+            "공개 입력 계약 위반: 후보 게시 상태 allow-list가 구현과 다릅니다."
+        )
+    briefing = conn.execute(
+        "SELECT MAX(batch_id) FROM source_batches WHERE batch_date = ? "
+        "AND source_kind IN ('briefing-md', 'paste')", (date_iso,)
+    ).fetchone()[0]
+    collector = conn.execute(
+        "SELECT MAX(batch_id) FROM source_batches WHERE batch_date = ? "
+        "AND source_kind = 'collector-json'", (date_iso,)
+    ).fetchone()[0]
+    if briefing is None or collector is None or briefing >= collector:
+        raise ValueError(
+            "공개 입력 순서 위반: briefing-md를 먼저, collector-json을 다음에 넣어야 합니다."
+        )
+
+
+def validate_publication_contract(html: str, contract: dict) -> None:
+    """레이아웃·유형 순서·공개 안전 규칙이 승인 JSON과 같지 않으면 실패한다."""
+    main_pos = html.find("<main")
+    if main_pos < 0:
+        raise ValueError("공개 구조 위반: <main>이 없습니다.")
+    body = html[main_pos:]
+    layout = contract["layout"]
+    if layout.get("section_presence_policy") != "render_when_non_empty":
+        raise ValueError("공개 구조 위반: 지원하지 않는 섹션 표시 정책입니다.")
+    positions = []
+    for section in layout["sections_in_order"]:
+        pos = body.find(f"<h2>{section}")
+        if pos >= 0:
+            positions.append(pos)
+    if positions != sorted(positions):
+        raise ValueError("공개 구조 위반: 표시된 섹션 순서가 변경됐습니다.")
+    for token in layout["required_css_tokens"]:
+        if token not in html:
+            raise ValueError(f"공개 구조 위반: 반응형 CSS 토큰 누락 - {token}")
+    if newsdb.TYPE_ORDER != contract["article_type_order"]:
+        raise ValueError("공개 구조 위반: 기사 유형 순서가 승인 계약과 다릅니다.")
+    marker = contract["public_safety"]["required_marker"]
+    if marker not in html:
+        raise ValueError(f"공개 안전 위반: 필수 표기 누락 - {marker}")
+    for forbidden in contract["public_safety"]["forbidden_text"]:
+        if forbidden in body:
+            raise ValueError(f"공개 안전 위반: 금지 문구 노출 - {forbidden}")
 
 
 def _fmt(date_iso: str) -> str:
@@ -208,9 +273,12 @@ def build(site_dir: Path, date_iso: str = None, db_path: str = None):
     (site_dir / "archive").mkdir(exist_ok=True)
 
     if date_iso:
+        contract = load_publication_contract()
         conn = newsdb.open_db(db_path)
+        validate_ingestion_contract(conn, date_iso, contract)
         html = newsdb.render_digest_html(newsdb.build_digest_data(conn, date_iso), public=True)
         conn.close()
+        validate_publication_contract(html, contract)
         (site_dir / "archive" / f"{date_iso}.html").write_text(html, encoding="utf-8", newline="\n")
 
     dates = sorted(set(existing_dates(site_dir)), reverse=True)

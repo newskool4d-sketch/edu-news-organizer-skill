@@ -98,12 +98,14 @@ class TestDigestSourcePreservation(unittest.TestCase):
         self.conn.close()
         self.tmp.cleanup()
 
-    def test_raw_collector_pool_remains_in_full_article_set(self):
+    def test_raw_collector_pool_is_preserved_but_not_published(self):
         raw = [
             {"title": "쿠팡, 인천 물류센터 화재 판매자 재고 보상",
-             "publisher": "상업매체", "original_url": "https://a.kr/raw1"},
+             "publisher": "상업매체", "original_url": "https://a.kr/raw1",
+             "relevance_hint": "likely_irrelevant"},
             {"title": "전국 학생 대상 공모전 개최",
-             "publisher": "미확인매체", "original_url": "https://a.kr/raw2"},
+             "publisher": "미확인매체", "original_url": "https://a.kr/raw2",
+             "relevance_hint": "likely_irrelevant"},
         ]
         newsdb.ingest_articles(
             self.conn, "2026-07-24", "인천교육", raw,
@@ -113,9 +115,13 @@ class TestDigestSourcePreservation(unittest.TestCase):
         data = newsdb.build_digest_data(self.conn, "2026-07-24")
         incheon_titles = [r["title"] for _, items in data["all_by_type"] for r in items]
         other_titles = [r["title"] for r in data["other_articles"]]
-        self.assertEqual(data["meta"]["total"], 2)
-        self.assertIn("쿠팡, 인천 물류센터 화재 판매자 재고 보상", incheon_titles)
-        self.assertIn("전국 학생 대상 공모전 개최", other_titles)
+        self.assertEqual(data["meta"]["total"], 0)
+        self.assertEqual(data["meta"]["candidate_total"], 2)
+        self.assertEqual(incheon_titles, [])
+        self.assertEqual(other_titles, [])
+        self.assertEqual(
+            len(newsdb.search_articles(self.conn, date="2026-07-24")), 2
+        )
 
     def test_briefing_marks_selected_without_removing_pool_only_articles(self):
         selected = [{
@@ -135,6 +141,7 @@ class TestDigestSourcePreservation(unittest.TestCase):
                 "title": "쿠팡, 인천 물류센터 화재 판매자 재고 보상",
                 "publisher": "상업매체",
                 "original_url": "https://a.kr/raw",
+                "relevance_hint": "likely_irrelevant",
             },
         ]
         newsdb.ingest_articles(
@@ -152,15 +159,10 @@ class TestDigestSourcePreservation(unittest.TestCase):
         selected_rows = newsdb.search_articles(
             self.conn, date="2026-07-24", source_kind="briefing-md"
         )
-        self.assertCountEqual(
-            incheon_titles,
-            [
-                "갑룡초 학생, 전국 발명대회 입상",
-                "쿠팡, 인천 물류센터 화재 판매자 재고 보상",
-            ],
-        )
+        self.assertEqual(incheon_titles, ["갑룡초 학생, 전국 발명대회 입상"])
         self.assertEqual(other_titles, [])
-        self.assertEqual(data["meta"]["total"], 2)
+        self.assertEqual(data["meta"]["total"], 1)
+        self.assertEqual(data["meta"]["candidate_total"], 2)
         self.assertEqual(selected_rows[0]["relevance_hint"], "likely_relevant")
         self.assertEqual(json.loads(selected_rows[0]["location_hits"]), ["강화군"])
 

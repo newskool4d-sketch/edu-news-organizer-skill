@@ -130,6 +130,105 @@ class TestArchiveIndex(unittest.TestCase):
         self.assertNotIn("<script>alert", html)
 
 
+class TestPublicationContract(unittest.TestCase):
+    @staticmethod
+    def _sparse_public_data(section: str) -> dict:
+        article = {
+            "title": "인천교육 정책 안내",
+            "publisher": "예시매체",
+            "original_url": "https://example.com/article",
+        }
+        data = {
+            "batch_date": "2026-08-12",
+            "meta": {
+                "total": 1 if section != "empty" else 0,
+                "issue_count": 1 if section == "hero" else 0,
+                "interest_count": 0,
+                "publisher_count": 1 if section != "empty" else 0,
+                "other_count": 1 if section == "other" else 0,
+            },
+            "hero_issues": [],
+            "interest_articles": [],
+            "all_by_type": [],
+            "other_issues": [],
+            "other_articles": [],
+        }
+        if section == "hero":
+            data["hero_issues"] = [{
+                "title": article["title"],
+                "article_type": "정책·현안",
+                "fields": ["교육행정"],
+                "member_count": 2,
+                "summary": "",
+                "representative": article,
+                "others": [],
+            }]
+        elif section == "single":
+            data["all_by_type"] = [("정책·현안", [article])]
+        elif section == "other":
+            data["other_articles"] = [article]
+        return data
+
+    def test_locked_contract_records_approved_structure_and_order(self):
+        contract = publish_site.load_publication_contract()
+        self.assertTrue(contract["locked"])
+        self.assertEqual(
+            contract["ingestion"]["order"], ["briefing-md", "collector-json"]
+        )
+        self.assertEqual(
+            frozenset(contract["ingestion"]["publish_candidate_statuses"]),
+            newsdb.PUBLISHABLE_CANDIDATE_STATUSES,
+        )
+        self.assertEqual(
+            contract["layout"]["sections_in_order"],
+            ["오늘의 핵심 이슈", "전체 기사", "타 시도·일반 교육 동향"],
+        )
+        self.assertEqual(
+            contract["layout"]["section_presence_policy"],
+            "render_when_non_empty",
+        )
+        self.assertEqual(contract["article_type_order"], newsdb.TYPE_ORDER)
+
+    def test_validator_accepts_current_approved_public_shape(self):
+        contract = publish_site.load_publication_contract()
+        sections = "".join(
+            f'<section><h2>{name}</h2></section>'
+            for name in contract["layout"]["sections_in_order"]
+        )
+        css = "\n".join(contract["layout"]["required_css_tokens"])
+        html = (
+            f'<html><head><style>{css}</style></head><body>'
+            f'{contract["public_safety"]["required_marker"]}<main>{sections}</main></body></html>'
+        )
+        publish_site.validate_publication_contract(html, contract)
+
+    def test_validator_accepts_real_sparse_public_renders(self):
+        contract = publish_site.load_publication_contract()
+        for section in ("empty", "hero", "single", "other"):
+            with self.subTest(section=section):
+                html = newsdb.render_digest_html(
+                    self._sparse_public_data(section), public=True
+                )
+                publish_site.validate_publication_contract(html, contract)
+
+    def test_validator_blocks_missing_or_reordered_sections(self):
+        contract = publish_site.load_publication_contract()
+        css = "\n".join(contract["layout"]["required_css_tokens"])
+        html = (
+            f'<html><style>{css}</style>{contract["public_safety"]["required_marker"]}'
+            '<main><h2>전체 기사</h2><h2>오늘의 핵심 이슈</h2>'
+            '<h2>타 시도·일반 교육 동향</h2></main></html>'
+        )
+        with self.assertRaisesRegex(ValueError, "섹션 순서"):
+            publish_site.validate_publication_contract(html, contract)
+
+    def test_ingestion_validator_blocks_candidate_allowlist_drift(self):
+        contract = publish_site.load_publication_contract()
+        contract["ingestion"]["publish_candidate_statuses"] = ["likely_relevant"]
+        with self.assertRaisesRegex(ValueError, "allow-list"):
+            publish_site.validate_ingestion_contract(None, "2026-08-12", contract)
+
+
 class TestGitPush(unittest.TestCase):
     @mock.patch("publish_site.subprocess.run")
     def test_git_push_uses_iso_date_in_commit_message(self, run):

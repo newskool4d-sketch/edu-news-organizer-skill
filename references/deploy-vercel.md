@@ -54,6 +54,8 @@ python ~/.codex/skills/edu-news-organizer/scripts/publish_site.py `
 
 ## 안전 설계 메모
 
+- `references/publication-contract.json`을 공개 구조 정본으로 사용한다. 입력 순서, 데이터가 있는 최대 3개 섹션의 상대 순서,
+  반응형 열, 기사 유형 순서, 공개 안전 표기가 계약과 다르면 게시 빌드가 실패한다.
 - 웹 배포본은 `--public` 렌더라 개인 메모·관심업무·관심 키워드 통계가 **포함되지 않는다**.
 - 공식 CI를 쓰되 "비공식·개인 정리용" 표기와 하단 고지로 공식 발행물 오인을 방지한다.
 - 전체 개인 버전이 필요하면 로컬에서 `digest --format html`(--public 없이)로 별도 생성.

@@ -1,0 +1,62 @@
+{
+  "schema_version": 1,
+  "contract_id": "edu-news-publication-locked-v1",
+  "locked": true,
+  "approved_on": "2026-08-03",
+  "change_policy": "explicit_user_approval_required",
+  "canonical_reference": {
+    "date": "2026-07-31",
+    "site_archive_path": "archive/2026-07-31.html"
+  },
+  "ingestion": {
+    "order": [
+      "briefing-md",
+      "collector-json"
+    ],
+    "preserve_all_candidates_in_database": true,
+    "publish_candidate_statuses": [
+      "likely_relevant",
+      "needs_review"
+    ],
+    "always_publish_explicit_briefing_items": true,
+    "exclude_candidate_statuses": [
+      "likely_irrelevant"
+    ]
+  },
+  "layout": {
+    "template_file": "scripts/digest_html.py",
+    "template_change_policy": "no_change_without_explicit_user_approval",
+    "sections_in_order": [
+      "오늘의 핵심 이슈",
+      "전체 기사",
+      "타 시도·일반 교육 동향"
+    ],
+    "section_presence_policy": "render_when_non_empty",
+    "responsive_columns": {
+      "desktop": 4,
+      "max_width_1100px": 2,
+      "max_width_720px": 1
+    },
+    "required_css_tokens": [
+      "grid-template-columns:repeat(4,minmax(0,1fr))",
+      "@media (max-width:1100px)",
+      "@media (max-width:720px)"
+    ]
+  },
+  "article_type_order": [
+    "교육감",
+    "정책·현안",
+    "인터뷰·기획",
+    "사업·성과",
+    "행사·모집",
+    "기타",
+    "비판·점검",
+    "타 시도 동향"
+  ],
+  "public_safety": {
+    "required_marker": "비공식 · 개인 정리용",
+    "forbidden_text": [
+      "내 관심업무"
+    ]
+  }
+}

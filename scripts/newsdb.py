@@ -51,6 +51,7 @@ def match_interests(title: str, keywords: list) -> list:
 # ---------- 2단계: 동일보도 묶기·분류 ----------
 
 GROUP_THRESHOLD = 0.60  # 정규화 제목 SequenceMatcher 비율 (실데이터 보정값)
+BRIEFING_GROUP_THRESHOLD = 0.75  # 인천 명시 선별 기사끼리 같은 사안으로 묶는 보수적 경계
 
 
 def normalize_title(title: str) -> str:
@@ -124,6 +125,34 @@ def classify_fields(title: str) -> list:
 
 
 DIGEST_SOURCE_PRIORITY = ("briefing-md", "paste")
+PUBLISHABLE_CANDIDATE_STATUSES = frozenset({"likely_relevant", "needs_review"})
+
+
+def _selection_source_rank(source_kind: str) -> int:
+    """선별 관계가 겹칠 때 명시 브리핑을 후보 판정보다 우선한다."""
+    if source_kind in DIGEST_SOURCE_PRIORITY:
+        return DIGEST_SOURCE_PRIORITY.index(source_kind)
+    if source_kind == "collector-json":
+        return len(DIGEST_SOURCE_PRIORITY)
+    return len(DIGEST_SOURCE_PRIORITY) + 1
+
+
+def _preferred_selection_predicate(selection_alias: str = "s") -> str:
+    """같은 날짜·기사의 여러 목록 관계 중 공개 계산에 쓸 한 관계를 고른다."""
+    explicit_cases = " ".join(
+        f"WHEN '{source_kind}' THEN {rank}"
+        for rank, source_kind in enumerate(DIGEST_SOURCE_PRIORITY)
+    )
+    collector_rank = len(DIGEST_SOURCE_PRIORITY)
+    return (
+        f"{selection_alias}.rowid = (SELECT s2.rowid FROM article_selections s2 "
+        f"WHERE s2.article_id = {selection_alias}.article_id "
+        f"AND s2.batch_date = {selection_alias}.batch_date "
+        f"ORDER BY CASE s2.source_kind {explicit_cases} "
+        f"WHEN 'collector-json' THEN {collector_rank} ELSE {collector_rank + 1} END, "
+        "CASE WHEN s2.list_type = '인천교육' THEN 0 ELSE 1 END, "
+        "s2.input_order, s2.rowid LIMIT 1)"
+    )
 
 
 def build_groups(conn, batch_date: str) -> int:
@@ -133,8 +162,7 @@ def build_groups(conn, batch_date: str) -> int:
     """
     # 멱등성: 이 날짜 기사가 속한 기존 그룹 제거 후 재생성
     old = [r[0] for r in conn.execute(
-        "SELECT DISTINCT i.group_id FROM article_group_items i "
-        "JOIN articles a ON a.article_id = i.article_id WHERE a.batch_date = ?",
+        "SELECT group_id FROM article_groups WHERE batch_date = ?",
         (batch_date,)).fetchall()]
     if old:
         marks = ",".join("?" * len(old))
@@ -142,8 +170,12 @@ def build_groups(conn, batch_date: str) -> int:
         conn.execute(f"DELETE FROM article_groups WHERE group_id IN ({marks})", old)
 
     rows = conn.execute(
-        "SELECT article_id, title, published_at, input_order FROM articles "
-        "WHERE batch_date = ? ORDER BY article_id", (batch_date,)).fetchall()
+        "SELECT a.article_id, a.title, a.published_at, s.input_order, "
+        "s.source_kind AS origin_source_kind "
+        "FROM article_selections s JOIN articles a ON a.article_id = s.article_id "
+        "WHERE s.batch_date = ? AND " + _preferred_selection_predicate("s")
+        + " ORDER BY s.input_order, a.article_id",
+        (batch_date,)).fetchall()
 
     # union-find로 유사 쌍 병합
     parent = {r["article_id"]: r["article_id"] for r in rows}
@@ -155,13 +187,46 @@ def build_groups(conn, batch_date: str) -> int:
         return x
 
     norm = {r["article_id"]: normalize_title(r["title"]) for r in rows}
+    titles = {r["article_id"]: r["title"] for r in rows}
+    briefing_ids = {
+        r["article_id"] for r in rows
+        if r["origin_source_kind"] in DIGEST_SOURCE_PRIORITY
+    }
+    component_briefings = {
+        article_id: ({article_id} if article_id in briefing_ids else set())
+        for article_id in parent
+    }
     import difflib
+    edges = []
     for i in range(len(rows)):
         for j in range(i + 1, len(rows)):
             a, b = rows[i], rows[j]
             ratio = difflib.SequenceMatcher(None, norm[a["article_id"]], norm[b["article_id"]]).ratio()
             if ratio >= GROUP_THRESHOLD:
-                parent[find(a["article_id"])] = find(b["article_id"])
+                edges.append((ratio, a["article_id"], b["article_id"]))
+
+    # 유사도 높은 간선부터 병합하되, 후보 기사의 전이 연결이 서로 다른
+    # 브리핑 명시 사안을 하나의 그룹으로 합치지 못하게 한다.
+    for _ratio, article_a, article_b in sorted(
+            edges, key=lambda edge: (-edge[0], edge[1], edge[2])):
+        root_a, root_b = find(article_a), find(article_b)
+        if root_a == root_b:
+            continue
+        explicit_a = component_briefings[root_a]
+        explicit_b = component_briefings[root_b]
+        if explicit_a and explicit_b:
+            same_explicit_story = all(
+                difflib.SequenceMatcher(None, norm[left], norm[right]).ratio()
+                >= (BRIEFING_GROUP_THRESHOLD
+                    if (is_incheon_title(titles[left]) or is_incheon_title(titles[right]))
+                    else GROUP_THRESHOLD)
+                for left in explicit_a for right in explicit_b
+            )
+            if not same_explicit_story:
+                continue
+        parent[root_a] = root_b
+        component_briefings[root_b] = explicit_a | explicit_b
+        del component_briefings[root_a]
 
     clusters = {}
     for r in rows:
@@ -171,12 +236,16 @@ def build_groups(conn, batch_date: str) -> int:
     for members in clusters.values():
         if len(members) < 2:
             continue
-        # 대표기사: 발행시각 빠른 기사 (없으면 입력 순서)
-        rep = min(members, key=lambda r: (r["published_at"] or "9999", r["input_order"]))
+        # 대표기사: 브리핑 명시 기사 우선, 그 안에서는 발행시각·입력 순서 적용
+        rep = min(members, key=lambda r: (
+            0 if r["origin_source_kind"] in DIGEST_SOURCE_PRIORITY else 1,
+            r["published_at"] or "9999",
+            r["input_order"],
+        ))
         cur = conn.execute(
-            "INSERT INTO article_groups(group_title, summary, category, article_type, priority, "
-            "representative_article_id, created_at, updated_at) VALUES (?, '', ?, ?, 0, ?, ?, ?)",
-            (rep["title"], ",".join(classify_fields(rep["title"])), classify_type(rep["title"]),
+            "INSERT INTO article_groups(batch_date, group_title, summary, category, article_type, priority, "
+            "representative_article_id, created_at, updated_at) VALUES (?, ?, '', ?, ?, 0, ?, ?, ?)",
+            (batch_date, rep["title"], ",".join(classify_fields(rep["title"])), classify_type(rep["title"]),
              rep["article_id"], _now(), _now()))
         gid = cur.lastrowid
         for m in members:
@@ -329,8 +398,18 @@ CREATE TABLE IF NOT EXISTS articles (
     education_subject_hits TEXT DEFAULT '[]',
     student_story_hits TEXT DEFAULT '[]',
     negative_context_hits TEXT DEFAULT '[]',
+    selected_for_digest INTEGER NOT NULL DEFAULT 0,
     input_order INTEGER DEFAULT 0,
     collected_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS article_selections (
+    article_id INTEGER NOT NULL REFERENCES articles(article_id),
+    batch_date TEXT NOT NULL,
+    list_type TEXT NOT NULL,
+    source_kind TEXT NOT NULL,
+    input_order INTEGER NOT NULL DEFAULT 0,
+    selected_at TEXT NOT NULL,
+    PRIMARY KEY(article_id, batch_date, list_type)
 );
 CREATE TABLE IF NOT EXISTS user_actions (
     action_id INTEGER PRIMARY KEY,
@@ -355,6 +434,7 @@ CREATE TABLE IF NOT EXISTS interests (
 -- 2단계(스마트 정리)용 스키마 예약 — 계획서 Ⅶ장 구조 유지
 CREATE TABLE IF NOT EXISTS article_groups (
     group_id INTEGER PRIMARY KEY,
+    batch_date TEXT NOT NULL DEFAULT '',
     group_title TEXT NOT NULL,
     summary TEXT DEFAULT '',
     category TEXT DEFAULT '',
@@ -373,6 +453,7 @@ CREATE TABLE IF NOT EXISTS article_group_items (
 );
 CREATE INDEX IF NOT EXISTS idx_articles_batch_date ON articles(batch_date);
 CREATE INDEX IF NOT EXISTS idx_articles_title ON articles(title);
+CREATE INDEX IF NOT EXISTS idx_article_selections_date ON article_selections(batch_date, list_type);
 """
 
 SEED_INTERESTS = ["학생교육원", "체험교육", "학생안전", "수련활동", "학생자치",
@@ -391,6 +472,9 @@ def open_db(db_path: str = None) -> sqlite3.Connection:
     path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(path))
     conn.row_factory = sqlite3.Row
+    selections_table_existed = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'article_selections'"
+    ).fetchone() is not None
     conn.executescript(SCHEMA)
     # 마이그레이션: 2단계 분류 컬럼 (기존 DB 호환)
     cols = {r["name"] for r in conn.execute("PRAGMA table_info(articles)")}
@@ -398,6 +482,15 @@ def open_db(db_path: str = None) -> sqlite3.Connection:
         conn.execute("ALTER TABLE articles ADD COLUMN article_type TEXT DEFAULT ''")
     if "edu_fields" not in cols:
         conn.execute("ALTER TABLE articles ADD COLUMN edu_fields TEXT DEFAULT ''")
+    if "selected_for_digest" not in cols:
+        conn.execute("ALTER TABLE articles ADD COLUMN selected_for_digest INTEGER NOT NULL DEFAULT 0")
+    group_cols = {r["name"] for r in conn.execute("PRAGMA table_info(article_groups)")}
+    if "batch_date" not in group_cols:
+        conn.execute("ALTER TABLE article_groups ADD COLUMN batch_date TEXT NOT NULL DEFAULT ''")
+        conn.execute(
+            "UPDATE article_groups SET batch_date = COALESCE((SELECT a.batch_date FROM articles a "
+            "WHERE a.article_id = article_groups.representative_article_id), '')"
+        )
     metadata_columns = {
         "relevance_hint": "TEXT DEFAULT ''",
         "relevance_reasons": "TEXT DEFAULT '[]'",
@@ -409,6 +502,29 @@ def open_db(db_path: str = None) -> sqlite3.Connection:
     for name, definition in metadata_columns.items():
         if name not in cols:
             conn.execute(f"ALTER TABLE articles ADD COLUMN {name} {definition}")
+    # 기존 DB 백필은 관계 테이블이 처음 생기는 마이그레이션에서만 실행한다.
+    # 이후 재열기에서는 최신 briefing/collector ingest가 만든 삭제 상태를 보존한다.
+    if not selections_table_existed:
+        conn.execute(
+            "INSERT OR REPLACE INTO article_selections(article_id, batch_date, list_type, source_kind, "
+            "input_order, selected_at) SELECT a.article_id, a.batch_date, a.list_type, sb.source_kind, "
+            "a.input_order, a.collected_at FROM articles a JOIN source_batches sb ON sb.batch_id = a.batch_id "
+            "WHERE sb.source_kind IN ('briefing-md', 'paste')"
+        )
+        publishable_statuses = tuple(sorted(PUBLISHABLE_CANDIDATE_STATUSES))
+        marks = ",".join("?" for _ in publishable_statuses)
+        conn.execute(
+            "INSERT OR IGNORE INTO article_selections(article_id, batch_date, list_type, source_kind, "
+            "input_order, selected_at) SELECT a.article_id, a.batch_date, a.list_type, sb.source_kind, "
+            "a.input_order, a.collected_at FROM articles a JOIN source_batches sb ON sb.batch_id = a.batch_id "
+            f"WHERE sb.source_kind = 'collector-json' AND a.relevance_hint IN ({marks})",
+            publishable_statuses,
+        )
+    conn.execute(
+        "UPDATE articles SET selected_for_digest = CASE WHEN EXISTS "
+        "(SELECT 1 FROM article_selections s WHERE s.article_id = articles.article_id) "
+        "THEN 1 ELSE 0 END"
+    )
     conn.commit()
     return conn
 
@@ -426,6 +542,20 @@ def _json_list(value) -> str:
 
 def ingest_articles(conn, batch_date, list_type, articles, source_kind, raw_text):
     """기사 목록 저장. 반환: (신규 건수, 중복 건수). 원본은 source_batches에 보존."""
+    if source_kind in DIGEST_SOURCE_PRIORITY:
+        # 브리핑 재실행은 이전 브리핑 관계만 교체한다. 후보 풀의 게시 가능 관계는 유지한다.
+        conn.execute(
+            "DELETE FROM article_selections WHERE batch_date = ? AND list_type = ? "
+            "AND source_kind IN ('briefing-md', 'paste')",
+            (batch_date, list_type)
+        )
+    elif source_kind == "collector-json":
+        # 후보 재수집 시 이전 후보 판정만 교체한다. 브리핑에 명시된 기사는 보존한다.
+        conn.execute(
+            "DELETE FROM article_selections WHERE batch_date = ? AND list_type = ? "
+            "AND source_kind = 'collector-json'",
+            (batch_date, list_type)
+        )
     cur = conn.execute(
         "INSERT INTO source_batches(batch_date, list_type, source_kind, raw_text, article_count, created_at) "
         "VALUES (?, ?, ?, ?, ?, ?)",
@@ -437,26 +567,34 @@ def ingest_articles(conn, batch_date, list_type, articles, source_kind, raw_text
         if not url:
             continue
         title = a.get("title", "")
+        publishable = (
+            source_kind in DIGEST_SOURCE_PRIORITY
+            or (source_kind == "collector-json"
+                and a.get("relevance_hint", "") in PUBLISHABLE_CANDIDATE_STATUSES)
+        )
         cur = conn.execute(
             "INSERT OR IGNORE INTO articles(batch_id, batch_date, list_type, title, publisher, "
             "publisher_domain, original_url, clean_url, published_at, engine, queries, "
             "relevance_hint, relevance_reasons, location_hits, education_subject_hits, "
-            "student_story_hits, negative_context_hits, input_order, collected_at, article_type, edu_fields) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "student_story_hits, negative_context_hits, selected_for_digest, input_order, "
+            "collected_at, article_type, edu_fields) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (batch_id, batch_date, list_type, title, a.get("publisher", ""),
              a.get("publisher_domain", "") or urllib.parse.urlsplit(url).netloc,
              url, clean_url(url), a.get("published_at", ""), a.get("engine", ""),
              a.get("queries", ""), a.get("relevance_hint", ""),
              _json_list(a.get("relevance_reasons")), _json_list(a.get("location_hits")),
              _json_list(a.get("education_subject_hits")), _json_list(a.get("student_story_hits")),
-             _json_list(a.get("negative_context_hits")), order, _now(),
+             _json_list(a.get("negative_context_hits")), int(publishable), order, _now(),
              classify_type(title), ",".join(classify_fields(title))))
+        article_id = None
         if cur.rowcount == 1:
             new += 1
+            article_id = cur.lastrowid
         else:
             dup += 1
             existing = conn.execute(
-                "SELECT a.article_id, sb.source_kind FROM articles a "
+                "SELECT a.article_id, a.published_at, a.engine, a.queries, sb.source_kind FROM articles a "
                 "JOIN source_batches sb ON sb.batch_id = a.batch_id WHERE a.clean_url = ?",
                 (clean_url(url),)
             ).fetchone()
@@ -465,6 +603,7 @@ def ingest_articles(conn, batch_date, list_type, articles, source_kind, raw_text
             old_kind = existing["source_kind"] if existing else ""
             old_rank = (DIGEST_SOURCE_PRIORITY.index(old_kind)
                         if old_kind in DIGEST_SOURCE_PRIORITY else len(DIGEST_SOURCE_PRIORITY))
+            article_id = existing["article_id"] if existing else None
             if existing and source_kind in DIGEST_SOURCE_PRIORITY and new_rank < old_rank:
                 conn.execute(
                     "UPDATE articles SET batch_id = ?, batch_date = ?, list_type = ?, title = ?, "
@@ -473,10 +612,43 @@ def ingest_articles(conn, batch_date, list_type, articles, source_kind, raw_text
                     "WHERE article_id = ?",
                     (batch_id, batch_date, list_type, title, a.get("publisher", ""),
                      a.get("publisher_domain", "") or urllib.parse.urlsplit(url).netloc,
-                     url, a.get("published_at", ""), a.get("engine", ""), a.get("queries", ""),
+                     url, a.get("published_at", "") or existing["published_at"],
+                     a.get("engine", "") or existing["engine"],
+                     a.get("queries", "") or existing["queries"],
                      order, classify_type(title), ",".join(classify_fields(title)),
                      existing["article_id"])
                 )
+            if existing and source_kind == "collector-json":
+                # 재분류된 후보 JSON을 다시 넣으면 기존 URL의 판정 메타데이터도 최신화한다.
+                conn.execute(
+                    "UPDATE articles SET relevance_hint = ?, relevance_reasons = ?, location_hits = ?, "
+                    "education_subject_hits = ?, student_story_hits = ?, negative_context_hits = ?, "
+                    "article_type = ?, edu_fields = ? WHERE article_id = ?",
+                    (a.get("relevance_hint", ""), _json_list(a.get("relevance_reasons")),
+                     _json_list(a.get("location_hits")), _json_list(a.get("education_subject_hits")),
+                     _json_list(a.get("student_story_hits")), _json_list(a.get("negative_context_hits")),
+                     classify_type(title), ",".join(classify_fields(title)), existing["article_id"])
+                )
+        if publishable and article_id:
+            current_selection = conn.execute(
+                "SELECT source_kind FROM article_selections "
+                "WHERE article_id = ? AND batch_date = ? AND list_type = ?",
+                (article_id, batch_date, list_type),
+            ).fetchone()
+            if (current_selection is None
+                    or _selection_source_rank(source_kind)
+                    <= _selection_source_rank(current_selection["source_kind"])):
+                conn.execute(
+                    "INSERT OR REPLACE INTO article_selections(article_id, batch_date, list_type, "
+                    "source_kind, input_order, selected_at) VALUES (?, ?, ?, ?, ?, ?)",
+                    (article_id, batch_date, list_type, source_kind, order, _now())
+                )
+    if source_kind in DIGEST_SOURCE_PRIORITY or source_kind == "collector-json":
+        conn.execute(
+            "UPDATE articles SET selected_for_digest = CASE WHEN EXISTS "
+            "(SELECT 1 FROM article_selections s WHERE s.article_id = articles.article_id) "
+            "THEN 1 ELSE 0 END"
+        )
     conn.commit()
     return new, dup
 
@@ -523,19 +695,31 @@ def search_articles(conn, q=None, date=None, list_type=None, publisher=None,
                     favorite=None, read_status=None, interest_only=False,
                     include_excluded=False, selected=False, article_type=None,
                     edu_field=None, source_kind=None, limit=100):
-    """검색 결과를 dict 목록으로 반환. interest_hits는 조회 시점 관심 키워드 대조."""
+    """검색 결과를 dict 목록으로 반환. interest_hits는 조회 시점 관심 키워드 대조.
+
+    selected=True에서 날짜를 생략하면 기사 고유 목록이 아니라 날짜·목록별 선별 이력을 반환한다.
+    """
+    selection_fields = (", s.batch_date AS selection_batch_date, "
+                        "s.list_type AS selection_list_type, s.input_order AS selection_input_order, "
+                        "s.source_kind AS selection_source_kind "
+                        if selected else "")
+    selection_join = (" JOIN article_selections s ON s.article_id = a.article_id AND "
+                      + _preferred_selection_predicate("s") + " "
+                      if selected else " ")
     sql = ("SELECT a.*, COALESCE(u.read_status, 'unread') AS read_status, "
            "COALESCE(u.favorite, 0) AS favorite, COALESCE(u.excluded, 0) AS excluded, "
            "COALESCE(u.memo, '') AS memo, COALESCE(u.user_category, '') AS user_category, "
-           "sb.source_kind AS source_kind "
+           + ("s.source_kind AS source_kind " if selected else "sb.source_kind AS source_kind ")
+           + selection_fields +
            "FROM articles a JOIN source_batches sb ON sb.batch_id = a.batch_id "
+           + selection_join +
            "LEFT JOIN user_actions u ON u.target_type = 'article' "
            "AND u.target_id = a.article_id WHERE 1=1")
     vals = []
     if selected:
-        # 선별 기사 = 브리핑 md 배치로 처음 저장된 기사 (풀 전용 후보 제외)
-        sql += (" AND a.batch_id IN (SELECT batch_id FROM source_batches "
-                "WHERE source_kind = 'briefing-md')")
+        # 동일 URL이 여러 날짜에 다시 선정될 수 있으므로 날짜별 관계를 조회한다.
+        if date:
+            sql += " AND s.batch_date = ?"; vals.append(date)
     if source_kind:
         sql += " AND sb.source_kind = ?"; vals.append(source_kind)
     if article_type:
@@ -545,10 +729,11 @@ def search_articles(conn, q=None, date=None, list_type=None, publisher=None,
     if q:
         sql += " AND (a.title LIKE ? OR a.publisher LIKE ?)"
         vals.extend([f"%{q}%", f"%{q}%"])
-    if date:
+    if date and not selected:
         sql += " AND a.batch_date = ?"; vals.append(date)
     if list_type:
-        sql += " AND a.list_type = ?"; vals.append(list_type)
+        sql += (" AND s.list_type = ?" if selected else " AND a.list_type = ?")
+        vals.append(list_type)
     if publisher:
         sql += " AND a.publisher LIKE ?"; vals.append(f"%{publisher}%")
     if favorite:
@@ -557,7 +742,8 @@ def search_articles(conn, q=None, date=None, list_type=None, publisher=None,
         sql += " AND COALESCE(u.read_status, 'unread') = ?"; vals.append(read_status)
     if not include_excluded:
         sql += " AND COALESCE(u.excluded, 0) = 0"
-    sql += " ORDER BY a.batch_date DESC, a.input_order"
+    sql += (" ORDER BY s.batch_date DESC, s.input_order" if selected
+            else " ORDER BY a.batch_date DESC, a.input_order")
     # interest_only는 SQL 밖에서 거르므로 LIMIT을 먼저 걸면 관심 기사가 잘려 나간다 — 필터 후 절단
     if not interest_only:
         sql += " LIMIT ?"
@@ -615,7 +801,7 @@ def list_groups(conn, batch_date: str) -> list:
             "SELECT g.*, COUNT(i.article_id) AS member_count FROM article_groups g "
             "JOIN article_group_items i ON i.group_id = g.group_id "
             "JOIN articles a ON a.article_id = g.representative_article_id "
-            "WHERE a.batch_date = ? GROUP BY g.group_id", (batch_date,)).fetchall():
+            "WHERE g.batch_date = ? GROUP BY g.group_id", (batch_date,)).fetchall():
         d = dict(g)
         d["members"] = [dict(r) for r in conn.execute(
             "SELECT a.article_id, a.title, a.list_type, sb.source_kind, "
@@ -636,8 +822,8 @@ def set_group_summary(conn, group_id: int, summary: str):
     conn.commit()
 
 
-# 7/23 방식의 폭넓은 인천 후보 판정 마커.
-# 관련성 힌트는 최종 브리핑 선별에 쓰되, organizer의 전체 기사 집합을 축소하지 않는다.
+# 인천/타시도 표시는 공개 allow-list에 든 기사 안에서만 적용한다.
+# 명시 브리핑은 출처를 신뢰하고, collector-json 후보는 제목 표지로 구분한다.
 INCHEON_MARKERS = [
     "인천", "도성훈", "강화", "옹진", "영종", "검단", "송도", "청라",
     "제물포", "서해구", "부평", "계양", "미추홀", "연수구", "남동구",
@@ -654,7 +840,9 @@ def is_incheon_article(article: dict) -> bool:
     title = article.get("title", "")
     if is_incheon_title(title):
         return True
-    trusted = article.get("source_kind") in DIGEST_SOURCE_PRIORITY and article.get("list_type") == "인천교육"
+    effective_list_type = article.get("selection_list_type") or article.get("list_type")
+    trusted = (article.get("source_kind") in DIGEST_SOURCE_PRIORITY
+               and effective_list_type == "인천교육")
     if not trusted:
         return False
     stripped = title.lstrip()
@@ -666,9 +854,14 @@ def build_digest_data(conn, batch_date: str) -> dict:
 
     인천 뉴스(hero_issues·all_by_type)와 타시도·일반교육 뉴스(other_issues·other_articles)를 분리한다.
     묶음은 구성 기사 중 한 건이라도 검증된 인천 입력이거나 제목 근거가 있으면 인천으로 분류.
-    기사 집합은 7/23 방식대로 전체 수집 후보를 유지하고 TYPE_ORDER로 제시 순서만 조정한다.
+    원시 후보는 DB에 보존한다. 공개 묶음·다이제스트는 관련성 판정이
+    `likely_relevant`·`needs_review`인 후보와 브리핑 명시 기사의 합집합만 사용한다.
+    TYPE_ORDER는 사용자가 정한 정무적 표시 순서를 그대로 유지한다.
     """
-    rows = search_articles(conn, date=batch_date, limit=2000)
+    rows = search_articles(conn, date=batch_date, selected=True, limit=2000)
+    candidate_total = conn.execute(
+        "SELECT COUNT(*) FROM articles WHERE batch_date = ?", (batch_date,)
+    ).fetchone()[0]
     groups = list_groups(conn, batch_date)
     grouped_ids = {m["article_id"] for g in groups for m in g["members"]}
 
@@ -707,6 +900,7 @@ def build_digest_data(conn, batch_date: str) -> dict:
         "batch_date": batch_date,
         "meta": {
             "total": len(rows),
+            "candidate_total": candidate_total,
             "issue_count": len(hero_issues),
             "interest_count": len(interest_articles),
             "publisher_count": len(publishers),

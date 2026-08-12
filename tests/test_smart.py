@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 """2단계 스마트 정리 테스트 (TDD: 구현 전 작성) — 동일보도 묶기·분류·selected 필터."""
+import json
 import sys
 import tempfile
 import unittest
@@ -71,7 +72,10 @@ class TestGrouping(unittest.TestCase):
             {"title": "인천시의회 교육위, 교육청 직속기관 예산 편성 적정성 지적",
              "publisher": "중도일보", "original_url": "https://a.kr/3", "published_at": "2026-07-15 11:00"},
         ]
-        newsdb.ingest_articles(self.conn, "2026-07-15", "인천교육", arts, source_kind="test", raw_text="r")
+        newsdb.ingest_articles(
+            self.conn, "2026-07-15", "인천교육", arts,
+            source_kind="briefing-md", raw_text="r"
+        )
 
     def tearDown(self):
         self.conn.close()
@@ -94,6 +98,148 @@ class TestGrouping(unittest.TestCase):
             (rows[0]["representative_article_id"],)).fetchone()[0])
         self.assertTrue(rep_title)
 
+    def test_build_groups_prefers_explicit_briefing_item_as_representative(self):
+        tmp = tempfile.TemporaryDirectory()
+        conn = newsdb.open_db(str(Path(tmp.name) / "briefing-priority.db"))
+        briefing = [{
+            "title": "인천교육청, 읽걷쓰AI 실천공동체 워크숍 운영…교사 300명 참여",
+            "publisher": "인천in",
+            "original_url": "https://briefing.example/article",
+        }]
+        candidates = [{
+            "title": "인천광역시교육청, 읽걷쓰AI 교사 실천공동체 워크숍 개최",
+            "publisher": "후보매체",
+            "original_url": "https://candidate.example/article",
+            "published_at": "2026-07-15 08:00",
+            "relevance_hint": "likely_relevant",
+        }]
+        newsdb.ingest_articles(
+            conn, "2026-07-15", "인천교육", briefing,
+            source_kind="briefing-md", raw_text="briefing"
+        )
+        newsdb.ingest_articles(
+            conn, "2026-07-15", "인천교육", candidates,
+            source_kind="collector-json", raw_text="candidates"
+        )
+
+        newsdb.build_groups(conn, "2026-07-15")
+        groups = newsdb.list_groups(conn, "2026-07-15")
+        representative = next(
+            member for member in groups[0]["members"]
+            if member["article_id"] == groups[0]["representative_article_id"]
+        )
+        self.assertEqual(
+            representative["original_url"],
+            "https://briefing.example/article",
+        )
+        conn.close()
+        tmp.cleanup()
+
+    def test_build_groups_keeps_distinct_briefing_events_in_separate_groups(self):
+        tmp = tempfile.TemporaryDirectory()
+        conn = newsdb.open_db(str(Path(tmp.name) / "briefing-boundary.db"))
+        briefing = [
+            {
+                "title": "인천 신트리도서관, 하반기 평생학습프로그램 9개 강좌 운영",
+                "publisher": "매일일보",
+                "original_url": "https://briefing.example/sintri",
+            },
+            {
+                "title": "인천 계양도서관, 유아부터 어르신까지 하반기 평생학습 프로그램 운영",
+                "publisher": "한국강사신문",
+                "original_url": "https://briefing.example/gyeyang",
+            },
+        ]
+        candidates = [
+            {
+                "title": "인천광역시교육청신트리도서관, 2026년 하반기 평생학습프로그램 운영",
+                "publisher": "후보매체1",
+                "original_url": "https://candidate.example/sintri",
+                "published_at": "2026-07-15 08:00",
+                "relevance_hint": "likely_relevant",
+            },
+            {
+                "title": "인천 계양도서관, 유아·어르신 하반기 평생학습 프로그램 운영",
+                "publisher": "후보매체2",
+                "original_url": "https://candidate.example/gyeyang",
+                "published_at": "2026-07-15 08:10",
+                "relevance_hint": "likely_relevant",
+            },
+        ]
+        newsdb.ingest_articles(
+            conn, "2026-07-15", "인천교육", briefing,
+            source_kind="briefing-md", raw_text="briefing"
+        )
+        newsdb.ingest_articles(
+            conn, "2026-07-15", "인천교육", candidates,
+            source_kind="collector-json", raw_text="candidates"
+        )
+
+        newsdb.build_groups(conn, "2026-07-15")
+        groups = newsdb.list_groups(conn, "2026-07-15")
+        representative_urls = {
+            next(
+                member["original_url"] for member in group["members"]
+                if member["article_id"] == group["representative_article_id"]
+            )
+            for group in groups
+        }
+        self.assertEqual(
+            representative_urls,
+            {
+                "https://briefing.example/sintri",
+                "https://briefing.example/gyeyang",
+            },
+        )
+        conn.close()
+        tmp.cleanup()
+
+    def test_build_groups_uses_current_date_selection_source_for_reused_url(self):
+        tmp = tempfile.TemporaryDirectory()
+        conn = newsdb.open_db(str(Path(tmp.name) / "cross-date-source.db"))
+        recurring = {
+            "title": "인천교육청, 읽걷쓰 AI 교사 공동체 워크숍 개최",
+            "publisher": "과거브리핑매체",
+            "original_url": "https://example.com/recurring",
+            "published_at": "2026-08-11 08:00",
+        }
+        current_briefing = {
+            "title": "인천교육청, 읽걷쓰 AI 교사 공동체 워크숍 운영",
+            "publisher": "현재브리핑매체",
+            "original_url": "https://example.com/current-briefing",
+            "published_at": "2026-08-12 10:00",
+        }
+        current_candidate = dict(
+            recurring,
+            published_at="2026-08-12 07:00",
+            relevance_hint="likely_relevant",
+        )
+        newsdb.ingest_articles(
+            conn, "2026-08-11", "인천교육", [recurring],
+            source_kind="briefing-md", raw_text="previous briefing"
+        )
+        newsdb.ingest_articles(
+            conn, "2026-08-12", "인천교육", [current_briefing],
+            source_kind="briefing-md", raw_text="current briefing"
+        )
+        newsdb.ingest_articles(
+            conn, "2026-08-12", "인천교육", [current_candidate],
+            source_kind="collector-json", raw_text="current candidates"
+        )
+
+        self.assertEqual(newsdb.build_groups(conn, "2026-08-12"), 1)
+        group = newsdb.list_groups(conn, "2026-08-12")[0]
+        representative = next(
+            member for member in group["members"]
+            if member["article_id"] == group["representative_article_id"]
+        )
+        self.assertEqual(
+            representative["original_url"],
+            current_briefing["original_url"],
+        )
+        conn.close()
+        tmp.cleanup()
+
     def test_build_groups_is_idempotent(self):
         newsdb.build_groups(self.conn, "2026-07-15")
         newsdb.build_groups(self.conn, "2026-07-15")  # 재실행 시 중복 그룹 금지
@@ -102,16 +248,282 @@ class TestGrouping(unittest.TestCase):
 
 
 class TestSelectedFilter(unittest.TestCase):
-    def test_selected_filter_uses_briefing_source(self):
+    def test_candidate_first_then_briefing_preserves_metadata_and_marks_selected(self):
         tmp = tempfile.TemporaryDirectory()
         conn = newsdb.open_db(str(Path(tmp.name) / "t.db"))
         sel = [{"title": "선별 기사", "publisher": "매체", "original_url": "https://a.kr/s1"}]
-        pool = [{"title": "선별 기사", "publisher": "매체", "original_url": "https://a.kr/s1"},
-                {"title": "풀 전용 기사", "publisher": "매체", "original_url": "https://a.kr/p1"}]
-        newsdb.ingest_articles(conn, "2026-07-16", "인천교육", sel, source_kind="briefing-md", raw_text="r")
+        pool = [{"title": "선별 기사", "publisher": "매체", "original_url": "https://a.kr/s1",
+                 "relevance_hint": "likely_relevant", "location_hits": ["인천"],
+                 "published_at": "2026-07-16 09:00", "engine": "google-news-rss",
+                 "queries": "Q1:인천교육청"},
+                {"title": "풀 전용 기사", "publisher": "매체", "original_url": "https://a.kr/p1",
+                 "relevance_hint": "likely_irrelevant"}]
         newsdb.ingest_articles(conn, "2026-07-16", "인천교육", pool, source_kind="collector-json", raw_text="r")
+        newsdb.ingest_articles(conn, "2026-07-16", "인천교육", sel, source_kind="briefing-md", raw_text="r")
         rows = newsdb.search_articles(conn, selected=True)
         self.assertEqual([r["title"] for r in rows], ["선별 기사"])
+        self.assertEqual(rows[0]["relevance_hint"], "likely_relevant")
+        self.assertEqual(json.loads(rows[0]["location_hits"]), ["인천"])
+        self.assertEqual(rows[0]["published_at"], "2026-07-16 09:00")
+        self.assertEqual(rows[0]["engine"], "google-news-rss")
+        conn.close()
+        tmp.cleanup()
+
+    def test_briefing_first_then_collector_overlap_preserves_explicit_selection(self):
+        tmp = tempfile.TemporaryDirectory()
+        conn = newsdb.open_db(str(Path(tmp.name) / "briefing-first.db"))
+        shared_url = "https://a.kr/shared"
+        briefing = [{
+            "title": "읽걷쓰 AI 실천공동체 워크숍 운영",
+            "publisher": "브리핑매체",
+            "original_url": shared_url,
+        }]
+        candidates = [{
+            "title": "읽걷쓰 AI 실천공동체 워크숍 운영",
+            "publisher": "후보매체",
+            "original_url": shared_url,
+            "relevance_hint": "likely_relevant",
+        }]
+
+        newsdb.ingest_articles(
+            conn, "2026-08-12", "인천교육", briefing,
+            source_kind="briefing-md", raw_text="briefing"
+        )
+        newsdb.ingest_articles(
+            conn, "2026-08-12", "인천교육", candidates,
+            source_kind="collector-json", raw_text="candidates"
+        )
+
+        selected = newsdb.search_articles(
+            conn, date="2026-08-12", selected=True
+        )
+        self.assertEqual(len(selected), 1)
+        self.assertEqual(selected[0]["source_kind"], "briefing-md")
+        digest = newsdb.build_digest_data(conn, "2026-08-12")
+        incheon_titles = {
+            article["title"]
+            for _, articles in digest["all_by_type"]
+            for article in articles
+        }
+        self.assertEqual(incheon_titles, {briefing[0]["title"]})
+        self.assertEqual(digest["other_articles"], [])
+        conn.close()
+        tmp.cleanup()
+
+    def test_collector_publishes_relevant_and_review_but_not_irrelevant(self):
+        tmp = tempfile.TemporaryDirectory()
+        conn = newsdb.open_db(str(Path(tmp.name) / "triage.db"))
+        pool = [
+            {"title": "인천교육청 정책 점검", "publisher": "매체",
+             "original_url": "https://a.kr/relevant", "relevance_hint": "likely_relevant"},
+            {"title": "경남교육청 수업 사례", "publisher": "매체",
+             "original_url": "https://a.kr/review", "relevance_hint": "needs_review"},
+            {"title": "구청 폭염 냉장고 운영", "publisher": "매체",
+             "original_url": "https://a.kr/irrelevant", "relevance_hint": "likely_irrelevant"},
+            {"title": "판정 없는 후보", "publisher": "매체",
+             "original_url": "https://a.kr/missing"},
+            {"title": "미지 판정 후보", "publisher": "매체",
+             "original_url": "https://a.kr/unknown", "relevance_hint": "future_status"},
+        ]
+        newsdb.ingest_articles(
+            conn, "2026-08-03", "인천교육", pool,
+            source_kind="collector-json", raw_text="pool"
+        )
+        rows = newsdb.search_articles(conn, date="2026-08-03", selected=True)
+        self.assertEqual(
+            {r["title"] for r in rows},
+            {"인천교육청 정책 점검", "경남교육청 수업 사례"},
+        )
+        self.assertEqual(len(newsdb.search_articles(conn, date="2026-08-03")), 5)
+        conn.close()
+        tmp.cleanup()
+
+    def test_open_db_backfills_existing_publishable_collector_selection(self):
+        tmp = tempfile.TemporaryDirectory()
+        db_path = Path(tmp.name) / "migration.db"
+        conn = newsdb.open_db(str(db_path))
+        newsdb.ingest_articles(
+            conn,
+            "2026-08-03",
+            "인천교육",
+            [{
+                "title": "기존 후보 기사",
+                "publisher": "매체",
+                "original_url": "https://a.kr/legacy-candidate",
+                "relevance_hint": "likely_relevant",
+            }],
+            source_kind="collector-json",
+            raw_text="legacy candidates",
+        )
+        conn.execute("DROP TABLE article_selections")
+        conn.execute("UPDATE articles SET selected_for_digest = 0")
+        conn.commit()
+        conn.close()
+
+        migrated = newsdb.open_db(str(db_path))
+        selected = newsdb.search_articles(
+            migrated, date="2026-08-03", selected=True
+        )
+        self.assertEqual([row["title"] for row in selected], ["기존 후보 기사"])
+        self.assertEqual(selected[0]["source_kind"], "collector-json")
+        migrated.close()
+        tmp.cleanup()
+
+    def test_reopen_does_not_resurrect_removed_briefing_selection(self):
+        tmp = tempfile.TemporaryDirectory()
+        db_path = Path(tmp.name) / "briefing-reopen.db"
+        first = [
+            {"title": "제거 기사", "publisher": "매체",
+             "original_url": "https://a.kr/briefing-removed"},
+            {"title": "유지 기사", "publisher": "매체",
+             "original_url": "https://a.kr/briefing-kept"},
+        ]
+        revised = [first[1]]
+
+        conn = newsdb.open_db(str(db_path))
+        newsdb.ingest_articles(
+            conn, "2026-08-12", "인천교육", first,
+            source_kind="briefing-md", raw_text="first briefing"
+        )
+        conn.close()
+        conn = newsdb.open_db(str(db_path))
+        newsdb.ingest_articles(
+            conn, "2026-08-12", "인천교육", revised,
+            source_kind="briefing-md", raw_text="revised briefing"
+        )
+        conn.close()
+
+        reopened = newsdb.open_db(str(db_path))
+        selected = newsdb.search_articles(
+            reopened, date="2026-08-12", selected=True
+        )
+        self.assertEqual([row["title"] for row in selected], ["유지 기사"])
+        reopened.close()
+        tmp.cleanup()
+
+    def test_reopen_does_not_resurrect_removed_collector_selection(self):
+        tmp = tempfile.TemporaryDirectory()
+        db_path = Path(tmp.name) / "collector-reopen.db"
+        first = [
+            {"title": "제거 후보", "publisher": "매체",
+             "original_url": "https://a.kr/candidate-removed",
+             "relevance_hint": "likely_relevant"},
+            {"title": "유지 후보", "publisher": "매체",
+             "original_url": "https://a.kr/candidate-kept",
+             "relevance_hint": "needs_review"},
+        ]
+        revised = [first[1]]
+
+        conn = newsdb.open_db(str(db_path))
+        newsdb.ingest_articles(
+            conn, "2026-08-12", "인천교육", first,
+            source_kind="collector-json", raw_text="first candidates"
+        )
+        conn.close()
+        conn = newsdb.open_db(str(db_path))
+        newsdb.ingest_articles(
+            conn, "2026-08-12", "인천교육", revised,
+            source_kind="collector-json", raw_text="revised candidates"
+        )
+        conn.close()
+
+        reopened = newsdb.open_db(str(db_path))
+        selected = newsdb.search_articles(
+            reopened, date="2026-08-12", selected=True
+        )
+        self.assertEqual([row["title"] for row in selected], ["유지 후보"])
+        reopened.close()
+        tmp.cleanup()
+
+    def test_same_day_multi_list_selection_is_published_once_without_ghost_group(self):
+        tmp = tempfile.TemporaryDirectory()
+        conn = newsdb.open_db(str(Path(tmp.name) / "multi-list.db"))
+        article = {
+            "title": "공통 교육정책 설명회 개최",
+            "publisher": "매체",
+            "original_url": "https://a.kr/shared-list",
+        }
+        newsdb.ingest_articles(
+            conn, "2026-08-12", "전국·교육부", [article],
+            source_kind="paste", raw_text="national section"
+        )
+        newsdb.ingest_articles(
+            conn, "2026-08-12", "인천교육", [article],
+            source_kind="paste", raw_text="incheon section"
+        )
+
+        selected = newsdb.search_articles(
+            conn, date="2026-08-12", selected=True
+        )
+        self.assertEqual(len(selected), 1)
+        self.assertEqual(selected[0]["selection_list_type"], "인천교육")
+        self.assertEqual(newsdb.build_groups(conn, "2026-08-12"), 0)
+        digest = newsdb.build_digest_data(conn, "2026-08-12")
+        published = [
+            row
+            for _, rows in digest["all_by_type"]
+            for row in rows
+        ] + digest["other_articles"]
+        self.assertEqual(digest["meta"]["total"], 1)
+        self.assertEqual([row["title"] for row in published], [article["title"]])
+        self.assertEqual(digest["other_articles"], [])
+        conn.close()
+        tmp.cleanup()
+
+    def test_latest_briefing_replaces_previous_selection_for_same_date(self):
+        tmp = tempfile.TemporaryDirectory()
+        conn = newsdb.open_db(str(Path(tmp.name) / "replace.db"))
+        first = [
+            {"title": "첫 선별 기사", "publisher": "매체", "original_url": "https://a.kr/first"},
+            {"title": "유지 기사", "publisher": "매체", "original_url": "https://a.kr/keep"},
+        ]
+        revised = [
+            {"title": "유지 기사", "publisher": "매체", "original_url": "https://a.kr/keep"},
+        ]
+        newsdb.ingest_articles(
+            conn, "2026-07-16", "인천교육", first,
+            source_kind="briefing-md", raw_text="first"
+        )
+        newsdb.ingest_articles(
+            conn, "2026-07-16", "인천교육", revised,
+            source_kind="briefing-md", raw_text="revised"
+        )
+        rows = newsdb.search_articles(conn, date="2026-07-16", selected=True)
+        self.assertEqual([r["title"] for r in rows], ["유지 기사"])
+        self.assertEqual(
+            len(newsdb.search_articles(conn, date="2026-07-16")), 2
+        )
+        conn.close()
+        tmp.cleanup()
+
+    def test_same_url_can_be_selected_again_on_a_later_date(self):
+        tmp = tempfile.TemporaryDirectory()
+        conn = newsdb.open_db(str(Path(tmp.name) / "repeat-date.db"))
+        repeated = {
+            "title": "인천 학교 텃밭 교육 사례",
+            "publisher": "매체",
+            "original_url": "https://a.kr/repeated",
+        }
+        newsdb.ingest_articles(
+            conn, "2026-07-31", "인천교육", [repeated],
+            source_kind="briefing-md", raw_text="first date"
+        )
+        newsdb.ingest_articles(
+            conn, "2026-08-03", "인천교육", [repeated],
+            source_kind="briefing-md", raw_text="later date"
+        )
+
+        old_rows = newsdb.search_articles(conn, date="2026-07-31", selected=True)
+        new_rows = newsdb.search_articles(conn, date="2026-08-03", selected=True)
+        self.assertEqual([r["title"] for r in old_rows], [repeated["title"]])
+        self.assertEqual([r["title"] for r in new_rows], [repeated["title"]])
+        self.assertEqual(new_rows[0]["selection_batch_date"], "2026-08-03")
+        self.assertEqual(newsdb.build_digest_data(conn, "2026-08-03")["meta"]["total"], 1)
+        history = newsdb.search_articles(conn, selected=True)
+        self.assertEqual(
+            [row["selection_batch_date"] for row in history],
+            ["2026-08-03", "2026-07-31"],
+        )
         conn.close()
         tmp.cleanup()
 
