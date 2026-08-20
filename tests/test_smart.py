@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 """2단계 스마트 정리 테스트 (TDD: 구현 전 작성) — 동일보도 묶기·분류·selected 필터."""
 import json
+import sqlite3
 import sys
 import tempfile
 import unittest
@@ -9,6 +10,13 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent / "scripts"))
 
 import newsdb  # noqa: E402
+
+
+VERIFIED_METADATA = {
+    "body_status": "본문 검증 완료",
+    "publication_verification_basis": "본문에서 확인한 구체적 기관·사실 근거",
+    "publication_verified_at": "2026-08-20T00:00:00+00:00",
+}
 
 
 class TestNormalizeAndSimilarity(unittest.TestCase):
@@ -113,6 +121,7 @@ class TestGrouping(unittest.TestCase):
             "published_at": "2026-07-15 08:00",
             "relevance_hint": "likely_relevant",
             "publication_eligible": True,
+            **VERIFIED_METADATA,
         }]
         newsdb.ingest_articles(
             conn, "2026-07-15", "인천교육", briefing,
@@ -159,6 +168,7 @@ class TestGrouping(unittest.TestCase):
                 "published_at": "2026-07-15 08:00",
                 "relevance_hint": "likely_relevant",
                 "publication_eligible": True,
+                **VERIFIED_METADATA,
             },
             {
                 "title": "인천 계양도서관, 유아·어르신 하반기 평생학습 프로그램 운영",
@@ -167,6 +177,7 @@ class TestGrouping(unittest.TestCase):
                 "published_at": "2026-07-15 08:10",
                 "relevance_hint": "likely_relevant",
                 "publication_eligible": True,
+                **VERIFIED_METADATA,
             },
         ]
         newsdb.ingest_articles(
@@ -217,6 +228,7 @@ class TestGrouping(unittest.TestCase):
             published_at="2026-08-12 07:00",
             relevance_hint="likely_relevant",
             publication_eligible=True,
+            **VERIFIED_METADATA,
         )
         newsdb.ingest_articles(
             conn, "2026-08-11", "인천교육", [recurring],
@@ -320,7 +332,7 @@ class TestSelectedFilter(unittest.TestCase):
         pool = [
             {"title": "인천교육청 정책 점검", "publisher": "매체",
              "original_url": "https://a.kr/relevant", "relevance_hint": "likely_relevant",
-             "publication_eligible": True},
+             "publication_eligible": True, **VERIFIED_METADATA},
             {"title": "경남교육청 수업 사례", "publisher": "매체",
              "original_url": "https://a.kr/review", "relevance_hint": "needs_review"},
             {"title": "구청 폭염 냉장고 운영", "publisher": "매체",
@@ -357,6 +369,7 @@ class TestSelectedFilter(unittest.TestCase):
                 "original_url": "https://a.kr/legacy-candidate",
                 "relevance_hint": "likely_relevant",
                 "publication_eligible": True,
+                **VERIFIED_METADATA,
             }],
             source_kind="collector-json",
             raw_text="legacy candidates",
@@ -372,6 +385,106 @@ class TestSelectedFilter(unittest.TestCase):
         )
         self.assertEqual([row["title"] for row in selected], ["기존 후보 기사"])
         self.assertEqual(selected[0]["source_kind"], "collector-json")
+        migrated.close()
+        tmp.cleanup()
+
+    def test_open_db_quarantines_legacy_collector_selection_without_verification(self):
+        tmp = tempfile.TemporaryDirectory()
+        db_path = Path(tmp.name) / "legacy-unverified.db"
+        raw = sqlite3.connect(str(db_path))
+        raw.executescript(
+            """
+            CREATE TABLE source_batches (
+                batch_id INTEGER PRIMARY KEY,
+                batch_date TEXT NOT NULL,
+                list_type TEXT NOT NULL,
+                source_kind TEXT NOT NULL,
+                raw_text TEXT,
+                article_count INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL
+            );
+            CREATE TABLE articles (
+                article_id INTEGER PRIMARY KEY,
+                batch_id INTEGER,
+                batch_date TEXT NOT NULL,
+                list_type TEXT NOT NULL,
+                title TEXT NOT NULL,
+                publisher TEXT DEFAULT '',
+                publisher_domain TEXT DEFAULT '',
+                original_url TEXT NOT NULL,
+                clean_url TEXT NOT NULL UNIQUE,
+                published_at TEXT DEFAULT '',
+                body_status TEXT DEFAULT '본문 미수집',
+                engine TEXT DEFAULT '',
+                queries TEXT DEFAULT '',
+                relevance_hint TEXT DEFAULT '',
+                relevance_reasons TEXT DEFAULT '[]',
+                location_hits TEXT DEFAULT '[]',
+                education_subject_hits TEXT DEFAULT '[]',
+                student_story_hits TEXT DEFAULT '[]',
+                negative_context_hits TEXT DEFAULT '[]',
+                input_order INTEGER DEFAULT 0,
+                collected_at TEXT NOT NULL
+            );
+            CREATE TABLE article_selections (
+                article_id INTEGER NOT NULL,
+                batch_date TEXT NOT NULL,
+                list_type TEXT NOT NULL,
+                source_kind TEXT NOT NULL,
+                input_order INTEGER NOT NULL DEFAULT 0,
+                selected_at TEXT NOT NULL,
+                PRIMARY KEY(article_id, batch_date, list_type)
+            );
+            CREATE TABLE article_groups (
+                group_id INTEGER PRIMARY KEY,
+                group_title TEXT NOT NULL,
+                summary TEXT DEFAULT '',
+                category TEXT DEFAULT '',
+                article_type TEXT DEFAULT '',
+                priority INTEGER DEFAULT 0,
+                representative_article_id INTEGER,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE TABLE article_group_items (
+                group_id INTEGER NOT NULL,
+                article_id INTEGER NOT NULL,
+                similarity_type TEXT DEFAULT '',
+                similarity_score REAL DEFAULT 0,
+                UNIQUE(group_id, article_id)
+            );
+            """
+        )
+        raw.execute(
+            "INSERT INTO source_batches VALUES (1, '2026-08-03', '인천교육', 'collector-json', 'legacy', 1, '2026-08-03 05:00:00')"
+        )
+        raw.execute(
+            "INSERT INTO articles(article_id, batch_id, batch_date, list_type, title, original_url, clean_url, collected_at) "
+            "VALUES (1, 1, '2026-08-03', '인천교육', '기존 후보', 'https://a.kr/legacy', 'https://a.kr/legacy', '2026-08-03 05:00:00')"
+        )
+        raw.execute(
+            "INSERT INTO article_selections VALUES (1, '2026-08-03', '인천교육', 'collector-json', 1, '2026-08-03 05:00:00')"
+        )
+        raw.commit()
+        raw.close()
+
+        migrated = newsdb.open_db(str(db_path))
+        self.assertEqual(
+            migrated.execute(
+                "SELECT COUNT(*) FROM article_selections WHERE source_kind='collector-json'"
+            ).fetchone()[0],
+            0,
+        )
+        self.assertEqual(
+            migrated.execute(
+                "SELECT COUNT(*) FROM legacy_candidate_selections"
+            ).fetchone()[0],
+            1,
+        )
+        self.assertEqual(
+            migrated.execute("SELECT COUNT(*) FROM source_batches").fetchone()[0],
+            1,
+        )
         migrated.close()
         tmp.cleanup()
 
@@ -414,11 +527,11 @@ class TestSelectedFilter(unittest.TestCase):
             {"title": "제거 후보", "publisher": "매체",
              "original_url": "https://a.kr/candidate-removed",
              "relevance_hint": "likely_relevant",
-             "publication_eligible": True},
+             "publication_eligible": True, **VERIFIED_METADATA},
             {"title": "유지 후보", "publisher": "매체",
              "original_url": "https://a.kr/candidate-kept",
              "relevance_hint": "needs_review",
-             "publication_eligible": True},
+             "publication_eligible": True, **VERIFIED_METADATA},
         ]
         revised = [first[1]]
 
@@ -531,6 +644,41 @@ class TestSelectedFilter(unittest.TestCase):
         self.assertEqual(
             [row["selection_batch_date"] for row in history],
             ["2026-08-03", "2026-07-31"],
+        )
+        conn.close()
+        tmp.cleanup()
+
+    def test_same_url_candidate_publication_is_date_scoped(self):
+        tmp = tempfile.TemporaryDirectory()
+        conn = newsdb.open_db(str(Path(tmp.name) / "candidate-date-scope.db"))
+        first = {
+            "title": "인천교육청 1차 검증 기사",
+            "publisher": "매체",
+            "original_url": "https://a.kr/repeated-candidate",
+            "publication_eligible": True,
+            **VERIFIED_METADATA,
+        }
+        second = {
+            **first,
+            "title": "인천교육청 2차 미검증 기사",
+            "publication_eligible": False,
+            "body_status": "본문 미검증",
+            "publication_verification_basis": "",
+            "publication_verified_at": "",
+        }
+        newsdb.ingest_articles(
+            conn, "2026-08-01", "인천교육", [first],
+            source_kind="collector-json", raw_text="first",
+        )
+        newsdb.ingest_articles(
+            conn, "2026-08-02", "인천교육", [second],
+            source_kind="collector-json", raw_text="second",
+        )
+        self.assertEqual(
+            newsdb.build_digest_data(conn, "2026-08-01")["meta"]["total"], 1
+        )
+        self.assertEqual(
+            newsdb.build_digest_data(conn, "2026-08-02")["meta"]["total"], 0
         )
         conn.close()
         tmp.cleanup()

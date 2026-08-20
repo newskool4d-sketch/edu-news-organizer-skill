@@ -11,6 +11,13 @@ import newsdb  # noqa: E402
 import publish_site  # noqa: E402
 
 
+VERIFIED_METADATA = {
+    "body_status": "본문 검증 완료",
+    "publication_verification_basis": "본문에서 확인한 구체적 기관·사실 근거",
+    "publication_verified_at": "2026-08-20T00:00:00+00:00",
+}
+
+
 class TestPublicMode(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -181,7 +188,12 @@ class TestPublicationContract(unittest.TestCase):
         )
         self.assertEqual(
             contract["ingestion"]["publish_candidate_requires"],
-            ["publication_eligible"],
+            [
+                "publication_eligible",
+                "body_status",
+                "publication_verification_basis",
+                "publication_verified_at",
+            ],
         )
         self.assertEqual(
             contract["layout"]["sections_in_order"],
@@ -250,6 +262,16 @@ class TestPublicationContract(unittest.TestCase):
             '<a href="https://other.example/representative">인천교육감 선거 식사 제공 불법 선거운동</a>',
         )
 
+    def test_briefing_parity_accepts_html_escaped_query_url(self):
+        article = {
+            "title": "AI",
+            "original_url": "https://example.com/article?a=1&b=2",
+        }
+        publish_site.validate_briefing_published_content_parity(
+            [article],
+            '<a href="https://example.com/article?a=1&amp;b=2">AI</a>',
+        )
+
     def test_briefing_parity_rejects_missing_article(self):
         with self.assertRaisesRegex(ValueError, "브리핑-공개 콘텐츠 정합성"):
             publish_site.validate_briefing_published_content_parity(
@@ -273,6 +295,7 @@ class TestPublicationContract(unittest.TestCase):
                 "original_url": "https://example.com/candidate",
                 "relevance_hint": "likely_relevant",
                 "publication_eligible": True,
+                **VERIFIED_METADATA,
             }]
             newsdb.ingest_articles(
                 conn, "2026-08-13", "인천교육", briefing,
@@ -326,6 +349,7 @@ class TestPublicationContract(unittest.TestCase):
                     "original_url": "https://example.com/candidate",
                     "relevance_hint": "likely_relevant",
                     "publication_eligible": True,
+                    **VERIFIED_METADATA,
                 }],
                 source_kind="collector-json", raw_text="collector",
             )

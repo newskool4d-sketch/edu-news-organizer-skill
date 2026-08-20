@@ -66,9 +66,9 @@ def validate_ingestion_contract(conn, date_iso: str, contract: dict) -> None:
         raise ValueError(
             "공개 입력 계약 위반: 후보 게시 상태 allow-list가 구현과 다릅니다."
         )
-    if contract["ingestion"].get("publish_candidate_requires") != ["publication_eligible"]:
+    if contract["ingestion"].get("publish_candidate_requires") != newsdb.PUBLICATION_REQUIRED_FIELDS:
         raise ValueError(
-            "공개 입력 계약 위반: 후보 게시에는 publication_eligible 검증이 필요합니다."
+            "공개 입력 계약 위반: 후보 게시에는 본문 검증 메타데이터가 필요합니다."
         )
     briefing = conn.execute(
         "SELECT MAX(batch_id) FROM source_batches WHERE batch_date = ? "
@@ -159,7 +159,9 @@ def validate_briefing_published_content_parity(briefing_articles: list, publishe
     모두 공개 HTML에 존재하는지 2차 확인한다. 두 방식 모두 실패하면 release를 중단한다.
     """
     missing = []
-    html_lower = (published_html or "").lower()
+    # digest_html._link가 href의 '&'를 '&amp;'로 이스케이프하므로 비교 전에
+    # HTML entity를 복원한다. 제목 fallback은 URL이 대표 URL로 대체된 그룹에만 사용한다.
+    html_lower = _html.unescape(published_html or "").lower()
     for article in briefing_articles:
         url = _normalize_url(article.get("original_url") or article.get("url"))
         if url and url.lower() in html_lower:

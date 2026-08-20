@@ -130,14 +130,54 @@ DIGEST_SOURCE_PRIORITY = ("briefing-md", "paste")
 # relevance_hint는 수집·검토용 triage 값이다. 후보는 본문 검증 후
 # publication_eligible=True로 명시 승격된 경우에만 공개한다.
 PUBLISHABLE_CANDIDATE_STATUSES = frozenset()
+PUBLICATION_REQUIRED_FIELDS = [
+    "publication_eligible",
+    "body_status",
+    "publication_verification_basis",
+    "publication_verified_at",
+]
+VERIFIED_BODY_STATUS = "본문 검증 완료"
+# 구체성 자체는 사람이 확인하고, 저장 게이트는 빈 근거만 차단한다.
+# 임의의 문자 수 제한으로 유효한 짧은 근거를 잃지 않도록 한다.
+MIN_VERIFICATION_BASIS_LENGTH = 1
+
+
+def has_publication_verification(article: dict) -> bool:
+    """본문 검증 증거가 완비된 후보인지 판정한다.
+
+    선택 관계에 저장된 검증 메타데이터가 있으면 그것을 우선한다. 이를 통해
+    같은 URL이 다른 날짜에 재수집되어 최신 기사 행의 상태가 바뀌어도
+    과거 날짜의 공개 판정은 유지된다.
+    """
+    eligible = article.get(
+        "selection_publication_eligible",
+        article.get("publication_eligible"),
+    )
+    body_status = article.get(
+        "selection_body_status",
+        article.get("body_status", ""),
+    )
+    basis = str(article.get(
+        "selection_publication_verification_basis",
+        article.get("publication_verification_basis", ""),
+    ) or "").strip()
+    verified_at = str(article.get(
+        "selection_publication_verified_at",
+        article.get("publication_verified_at", ""),
+    ) or "").strip()
+    return (
+        eligible in (True, 1)
+        and str(body_status or "").strip() == VERIFIED_BODY_STATUS
+        and len(basis) >= MIN_VERIFICATION_BASIS_LENGTH
+        and bool(verified_at)
+    )
 
 
 def is_publishable_for_digest(article: dict) -> bool:
     """명시 브리핑 또는 본문 검증을 명시한 후보만 공개 대상으로 유지한다."""
     if article.get("source_kind") in DIGEST_SOURCE_PRIORITY:
         return True
-    # SQLite INTEGER 컬럼은 조회 시 0/1로 돌아오므로 Python bool과 함께 허용한다.
-    return article.get("publication_eligible") in (True, 1)
+    return has_publication_verification(article)
 
 
 def _selection_source_rank(source_kind: str) -> int:
@@ -439,7 +479,22 @@ CREATE TABLE IF NOT EXISTS article_selections (
     source_kind TEXT NOT NULL,
     input_order INTEGER NOT NULL DEFAULT 0,
     selected_at TEXT NOT NULL,
+    body_status TEXT DEFAULT '',
+    publication_eligible INTEGER NOT NULL DEFAULT 0,
+    publication_verification_basis TEXT DEFAULT '',
+    publication_verified_at TEXT DEFAULT '',
     PRIMARY KEY(article_id, batch_date, list_type)
+);
+CREATE TABLE IF NOT EXISTS legacy_candidate_selections (
+    article_id INTEGER NOT NULL,
+    batch_date TEXT NOT NULL,
+    list_type TEXT NOT NULL,
+    source_kind TEXT NOT NULL,
+    input_order INTEGER NOT NULL DEFAULT 0,
+    selected_at TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    quarantined_at TEXT NOT NULL,
+    PRIMARY KEY(article_id, batch_date, list_type, source_kind)
 );
 CREATE TABLE IF NOT EXISTS user_actions (
     action_id INTEGER PRIMARY KEY,
@@ -505,6 +560,9 @@ def open_db(db_path: str = None) -> sqlite3.Connection:
     selections_table_existed = conn.execute(
         "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'article_selections'"
     ).fetchone() is not None
+    selection_columns_before = {
+        r["name"] for r in conn.execute("PRAGMA table_info(article_selections)")
+    } if selections_table_existed else set()
     conn.executescript(SCHEMA)
     # 마이그레이션: 2단계 분류 컬럼 (기존 DB 호환)
     cols = {r["name"] for r in conn.execute("PRAGMA table_info(articles)")}
@@ -535,39 +593,107 @@ def open_db(db_path: str = None) -> sqlite3.Connection:
     for name, definition in metadata_columns.items():
         if name not in cols:
             conn.execute(f"ALTER TABLE articles ADD COLUMN {name} {definition}")
-    # 기존 DB 백필은 관계 테이블이 처음 생기는 마이그레이션에서만 실행한다.
-    # 이후 재열기에서는 최신 briefing/collector ingest가 만든 삭제 상태를 보존한다.
+
+    selection_columns = {r["name"] for r in conn.execute("PRAGMA table_info(article_selections)")}
+    selection_metadata_columns = {
+        "body_status": "TEXT DEFAULT ''",
+        "publication_eligible": "INTEGER NOT NULL DEFAULT 0",
+        "publication_verification_basis": "TEXT DEFAULT ''",
+        "publication_verified_at": "TEXT DEFAULT ''",
+    }
+    for name, definition in selection_metadata_columns.items():
+        if name not in selection_columns:
+            conn.execute(f"ALTER TABLE article_selections ADD COLUMN {name} {definition}")
+
+    # 관계 테이블이 처음 생기는 DB는 신뢰 가능한 명시 브리핑·본문 검증 후보만 백필한다.
     if not selections_table_existed:
         conn.execute(
             "INSERT OR REPLACE INTO article_selections(article_id, batch_date, list_type, source_kind, "
-            "input_order, selected_at) SELECT a.article_id, a.batch_date, a.list_type, sb.source_kind, "
-            "a.input_order, a.collected_at FROM articles a JOIN source_batches sb ON sb.batch_id = a.batch_id "
+            "input_order, selected_at, body_status, publication_eligible, "
+            "publication_verification_basis, publication_verified_at) "
+            "SELECT a.article_id, a.batch_date, a.list_type, sb.source_kind, "
+            "a.input_order, a.collected_at, a.body_status, 1, "
+            "a.publication_verification_basis, a.publication_verified_at "
+            "FROM articles a JOIN source_batches sb ON sb.batch_id = a.batch_id "
             "WHERE sb.source_kind IN ('briefing-md', 'paste')"
         )
-        if PUBLISHABLE_CANDIDATE_STATUSES:
-            publishable_statuses = tuple(sorted(PUBLISHABLE_CANDIDATE_STATUSES))
-            marks = ",".join("?" for _ in publishable_statuses)
+        conn.execute(
+            "UPDATE article_selections SET publication_eligible = 1 "
+            "WHERE source_kind IN ('briefing-md', 'paste')"
+        )
+        conn.execute(
+            "INSERT OR IGNORE INTO article_selections(article_id, batch_date, list_type, source_kind, "
+            "input_order, selected_at, body_status, publication_eligible, "
+            "publication_verification_basis, publication_verified_at) "
+            "SELECT a.article_id, a.batch_date, a.list_type, sb.source_kind, a.input_order, a.collected_at, "
+            "a.body_status, 1, a.publication_verification_basis, a.publication_verified_at "
+            "FROM articles a JOIN source_batches sb ON sb.batch_id = a.batch_id "
+            "WHERE sb.source_kind = 'collector-json' "
+            "AND a.publication_eligible = 1 "
+            "AND a.body_status = ? "
+            "AND LENGTH(TRIM(a.publication_verification_basis)) >= ? "
+            "AND LENGTH(TRIM(a.publication_verified_at)) > 0",
+            (VERIFIED_BODY_STATUS, MIN_VERIFICATION_BASIS_LENGTH),
+        )
+
+    # 구 스키마의 collector 관계는 본문 검증 증거가 없을 수 있다.
+    # 삭제하기 전에 격리 테이블로 옮겨 원본 관계와 마이그레이션 사유를 보존한다.
+    legacy_rows = conn.execute(
+        "SELECT s.article_id, s.batch_date, s.list_type, s.source_kind, s.input_order, s.selected_at, "
+        "s.body_status AS selection_body_status, s.publication_eligible AS selection_publication_eligible, "
+        "s.publication_verification_basis AS selection_publication_verification_basis, "
+        "s.publication_verified_at AS selection_publication_verified_at, "
+        "a.body_status AS article_body_status, a.publication_eligible, "
+        "a.publication_verification_basis, a.publication_verified_at "
+        "FROM article_selections s JOIN articles a ON a.article_id = s.article_id "
+        "WHERE s.source_kind = 'collector-json'"
+    ).fetchall()
+    for row in legacy_rows:
+        candidate = {
+            "source_kind": "collector-json",
+            "selection_body_status": row["selection_body_status"] or row["article_body_status"],
+            "selection_publication_eligible": (
+                row["selection_publication_eligible"]
+                if "publication_eligible" in selection_columns_before
+                else row["publication_eligible"]
+            ),
+            "selection_publication_verification_basis": (
+                row["selection_publication_verification_basis"]
+                or row["publication_verification_basis"]
+            ),
+            "selection_publication_verified_at": (
+                row["selection_publication_verified_at"]
+                or row["publication_verified_at"]
+            ),
+        }
+        if has_publication_verification(candidate):
             conn.execute(
-                "INSERT OR IGNORE INTO article_selections(article_id, batch_date, list_type, source_kind, "
-                "input_order, selected_at) SELECT a.article_id, a.batch_date, a.list_type, sb.source_kind, "
-                "a.input_order, a.collected_at FROM articles a JOIN source_batches sb ON sb.batch_id = a.batch_id "
-                f"WHERE sb.source_kind = 'collector-json' AND a.publication_eligible = 1 "
-                f"AND a.relevance_hint IN ({marks})",
-                publishable_statuses,
+                "UPDATE article_selections SET body_status = ?, publication_eligible = 1, "
+                "publication_verification_basis = ?, publication_verified_at = ? "
+                "WHERE article_id = ? AND batch_date = ? AND list_type = ?",
+                (
+                    VERIFIED_BODY_STATUS,
+                    candidate["selection_publication_verification_basis"],
+                    candidate["selection_publication_verified_at"],
+                    row["article_id"], row["batch_date"], row["list_type"],
+                ),
             )
-        else:
-            # 현재 계약은 triage 상태와 무관하게 본문 검증 플래그만 승격 근거로 삼는다.
-            conn.execute(
-                "INSERT OR IGNORE INTO article_selections(article_id, batch_date, list_type, source_kind, "
-                "input_order, selected_at) SELECT a.article_id, a.batch_date, a.list_type, sb.source_kind, "
-                "a.input_order, a.collected_at FROM articles a JOIN source_batches sb ON sb.batch_id = a.batch_id "
-                "WHERE sb.source_kind = 'collector-json' AND a.publication_eligible = 1"
-            )
-    # 기존 DB의 collector-json 선별 관계는 본문 검증 플래그가 없으므로 공개하지 않는다.
-    conn.execute(
-        "DELETE FROM article_selections WHERE source_kind = 'collector-json' "
-        "AND article_id IN (SELECT article_id FROM articles WHERE publication_eligible = 0)"
-    )
+            continue
+        conn.execute(
+            "INSERT OR IGNORE INTO legacy_candidate_selections("
+            "article_id, batch_date, list_type, source_kind, input_order, "
+            "selected_at, reason, quarantined_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                row["article_id"], row["batch_date"], row["list_type"], row["source_kind"],
+                row["input_order"], row["selected_at"],
+                "기존 후보 선택 관계에 본문 검증 근거 없음", _now(),
+            ),
+        )
+        conn.execute(
+            "DELETE FROM article_selections WHERE article_id = ? AND batch_date = ? AND list_type = ?",
+            (row["article_id"], row["batch_date"], row["list_type"]),
+        )
+
     conn.execute(
         "UPDATE articles SET selected_for_digest = CASE WHEN EXISTS "
         "(SELECT 1 FROM article_selections s WHERE s.article_id = articles.article_id) "
@@ -620,12 +746,14 @@ def ingest_articles(conn, batch_date, list_type, articles, source_kind, raw_text
             a.get("publication_verification_basis", "") or ""
         ).strip()
         publication_verified_at = str(a.get("publication_verified_at", "") or "").strip()
-        publication_eligible = a.get("publication_eligible") is True
-        publishable = is_publishable_for_digest(
-            {"source_kind": source_kind,
-             "relevance_hint": a.get("relevance_hint", ""),
-             "publication_eligible": publication_eligible}
+        requested_publication_eligible = a.get("publication_eligible") is True
+        publication_eligible = (
+            requested_publication_eligible
+            and body_status == VERIFIED_BODY_STATUS
+            and len(publication_verification_basis) >= MIN_VERIFICATION_BASIS_LENGTH
+            and bool(publication_verified_at)
         )
+        publishable = source_kind in DIGEST_SOURCE_PRIORITY or publication_eligible
         cur = conn.execute(
             "INSERT OR IGNORE INTO articles(batch_id, batch_date, list_type, title, publisher, "
             "publisher_domain, original_url, clean_url, published_at, body_status, "
@@ -699,8 +827,16 @@ def ingest_articles(conn, batch_date, list_type, articles, source_kind, raw_text
                     <= _selection_source_rank(current_selection["source_kind"])):
                 conn.execute(
                     "INSERT OR REPLACE INTO article_selections(article_id, batch_date, list_type, "
-                    "source_kind, input_order, selected_at) VALUES (?, ?, ?, ?, ?, ?)",
-                    (article_id, batch_date, list_type, source_kind, order, _now())
+                    "source_kind, input_order, selected_at, body_status, publication_eligible, "
+                    "publication_verification_basis, publication_verified_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        article_id, batch_date, list_type, source_kind, order, _now(),
+                        body_status,
+                        1,
+                        publication_verification_basis,
+                        publication_verified_at,
+                    )
                 )
     if source_kind in DIGEST_SOURCE_PRIORITY or source_kind == "collector-json":
         conn.execute(
@@ -760,7 +896,11 @@ def search_articles(conn, q=None, date=None, list_type=None, publisher=None,
     """
     selection_fields = (", s.batch_date AS selection_batch_date, "
                         "s.list_type AS selection_list_type, s.input_order AS selection_input_order, "
-                        "s.source_kind AS selection_source_kind "
+                        "s.source_kind AS selection_source_kind, "
+                        "s.body_status AS selection_body_status, "
+                        "s.publication_eligible AS selection_publication_eligible, "
+                        "s.publication_verification_basis AS selection_publication_verification_basis, "
+                        "s.publication_verified_at AS selection_publication_verified_at "
                         if selected else "")
     selection_join = (" JOIN article_selections s ON s.article_id = a.article_id AND "
                       + _preferred_selection_predicate("s") + " "

@@ -304,10 +304,21 @@ class TestParseCollectedJson(unittest.TestCase):
             "relevance_hint": "likely_relevant",
             "publication_eligible": False,
         }))
+        self.assertFalse(newsdb.is_publishable_for_digest({
+            "source_kind": "collector-json",
+            "relevance_hint": "likely_relevant",
+            "publication_eligible": True,
+            "body_status": "본문 미검증",
+            "publication_verification_basis": "",
+            "publication_verified_at": "",
+        }))
         self.assertTrue(newsdb.is_publishable_for_digest({
             "source_kind": "collector-json",
             "relevance_hint": "likely_relevant",
             "publication_eligible": True,
+            "body_status": "본문 검증 완료",
+            "publication_verification_basis": "본문에서 확인한 구체적 기관·사실 근거",
+            "publication_verified_at": "2026-08-20T00:00:00+00:00",
         }))
         self.assertTrue(newsdb.is_publishable_for_digest({
             "source_kind": "briefing-md",
@@ -344,6 +355,37 @@ class TestParseCollectedJson(unittest.TestCase):
             self.assertIn("학교 안전 협력", row["publication_verification_basis"])
             self.assertEqual(
                 row["publication_verified_at"], "2026-08-20T00:00:00+00:00"
+            )
+            conn.close()
+
+    def test_unverified_true_candidate_is_not_selected_or_published(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            conn = newsdb.open_db(str(Path(tmp) / "unverified.db"))
+            newsdb.ingest_articles(
+                conn,
+                "2026-08-20",
+                "인천교육",
+                [{
+                    "title": "인천교육청 검증 없는 후보",
+                    "publisher": "후보매체",
+                    "original_url": "https://a.kr/unverified",
+                    "publication_eligible": True,
+                    "body_status": "본문 미검증",
+                    "publication_verification_basis": "",
+                    "publication_verified_at": "",
+                }],
+                source_kind="collector-json",
+                raw_text="unverified",
+            )
+            self.assertEqual(
+                newsdb.search_articles(conn, date="2026-08-20", selected=True), []
+            )
+            self.assertEqual(
+                newsdb.build_digest_data(conn, "2026-08-20")["meta"]["total"], 0
+            )
+            self.assertEqual(
+                conn.execute("SELECT publication_eligible FROM articles").fetchone()[0],
+                0,
             )
             conn.close()
 

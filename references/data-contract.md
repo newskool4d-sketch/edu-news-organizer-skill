@@ -36,7 +36,9 @@
 `original_url` 없으면 `google_url` 폴백. 관련성 힌트와 근거 배열은 기사 테이블에 JSON 문자열로 보존한다.
 `engine: naver-api` 및 모든 `collector-json` 항목은 미선별 후보라는 점에 유의하며,
 `relevance_hint`는 triage 메타데이터일 뿐 최종 포함 판단이 아니다. `publication_eligible`는
-본문 검증 표식과 구체적 근거가 있는 후보만 `true`로 승격한다. 승격된 후보는
+본문 검증 표식과 구체적 근거가 있는 후보만 `true`로 승격한다. 공개 승격에는
+`body_status=본문 검증 완료`, 길이 있는 `publication_verification_basis`,
+`publication_verified_at`가 모두 필요하다. 승격된 후보는
 `body_status`, `publication_verification_basis`, `publication_verified_at`를 함께 보존한다.
 
 ## 2. 일일 브리핑 md (선별 완료본)
@@ -67,8 +69,9 @@ URL
 - 후보·선별 분리: 기존 게시 흐름대로 `briefing-md` 또는 본청 `paste`를 먼저 저장하고,
   `collector-json`을 이어서 저장해 후보 원본과 관련성 메타데이터를 보존한다. 본문 검증 표식으로
   승격된 파생 JSON이 있으면 원본 JSON 대신 그 파생본을 인제스트한다.
-  날짜별 `article_selections`에는 브리핑 명시 기사와 `publication_eligible=true` 후보만 기록한다.
-  같은 `clean_url`이 다른 날짜 선별본에 다시 등장해도 해당 날짜 관계와 입력 순서를 별도로 보존한다.
+  날짜별 `article_selections`에는 브리핑 명시 기사와 검증 메타데이터가 완비된
+  `publication_eligible=true` 후보만 기록한다. 검증 상태·근거·시각은 선택 관계에도 복사해
+  같은 `clean_url`이 다른 날짜에 재등장해도 날짜별 공개 판정을 독립적으로 보존한다.
 - 후보 보존: 모든 triage 상태 항목을 삭제하지 않고 내부 검색·검토용 DB에 보존한다.
   공개 묶음·다이제스트에서는 브리핑 명시 기사 또는 `publication_eligible=true` 후보만 게시한다.
 - 관련성 메타데이터: `relevance_hint`와 근거 배열은 상류 선별을 돕는 정보다. organizer는 이를
@@ -78,5 +81,8 @@ URL
   현 단계에서 별개로 저장된다 (실측: 브리핑 38건 중 37건 중복 감지, 1건 URL 변형 통과) —
   2단계 동일보도 묶기에서 처리 예정.
 - 원본 보존: 입력 전문을 `source_batches.raw_text`에 그대로 저장.
+- 구 스키마 마이그레이션: 본문 검증 근거가 없는 기존 `collector-json` 선택 관계는 공개 선택에서
+  제거하되 `legacy_candidate_selections`에 사유·날짜·입력 순서를 격리 보존한다. 실제 운영 DB 적용 전
+  백업과 격리 건수 확인이 필요하다.
 - DB: `%USERPROFILE%\Documents\Codex\EduNewsOrganizer\news.db`
   (환경변수 `EDU_NEWS_DB_PATH` 또는 `--db` 오버라이드). repo에는 커밋하지 않는다.

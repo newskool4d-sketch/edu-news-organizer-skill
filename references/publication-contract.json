@@ -14,10 +14,13 @@
       "collector-json"
     ],
     "preserve_all_candidates_in_database": true,
-      "publish_candidate_statuses": [],
-      "publish_candidate_requires": [
-        "publication_eligible"
-      ],
+    "publish_candidate_statuses": [],
+    "publish_candidate_requires": [
+      "publication_eligible",
+      "body_status",
+      "publication_verification_basis",
+      "publication_verified_at"
+    ],
     "always_publish_explicit_briefing_items": true,
     "exclude_candidate_statuses": [
       "likely_relevant",

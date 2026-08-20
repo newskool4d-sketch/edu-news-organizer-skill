@@ -67,12 +67,12 @@ python scripts/publish_site.py --site-dir <site폴더> --date 2026-07-16 --push 
 
 - DB 위치: `%USERPROFILE%\Documents\Codex\EduNewsOrganizer\news.db` (환경변수 `EDU_NEWS_DB_PATH` 또는 `--db`로 변경)
 - 원본 목록(raw_text)은 source_batches에 그대로 보존한다 (기본 원칙: 원본 보존)
-- 상류 JSON의 `relevance_hint`·판정 근거·위치/교육주체/학생활동 히트는 기사 단위로 보존한다. 후보 자체는 삭제하지 않는다. 공개 묶음·다이제스트에는 `likely_relevant`·`needs_review` 후보와 브리핑 명시 기사의 합집합을 사용해 기존 동일보도 묶음 구조를 유지한다.
+- 상류 JSON의 `relevance_hint`·판정 근거·위치/교육주체/학생활동 히트는 기사 단위로 보존한다. 후보 자체는 삭제하지 않는다. 공개 묶음·다이제스트에는 브리핑 명시 기사와 본문 검증 메타데이터가 완비된 `publication_eligible=true` 후보만 사용해 기존 동일보도 묶음 구조를 유지한다.
 - 관심도 표시는 저장 시점이 아니라 조회 시점에 interests 테이블과 대조한다 (키워드 변경 즉시 반영)
 
 ## Workflow
 
-1. 이전 승인 흐름대로 검증 완료 `briefing-md`를 먼저 넣고 `collector-json` 후보 풀을 이어서 넣는다. 같은 URL이 다른 날짜에 다시 등장해도 각 날짜 관계를 보존한다. 후보 전체는 검색·검토용으로 유지하되, 공개본은 브리핑 명시 기사와 allow-list인 `likely_relevant`·`needs_review` 후보만 기존 방식으로 묶어 싣는다.
+1. 이전 승인 흐름대로 검증 완료 `briefing-md`를 먼저 넣고 `collector-json` 후보 풀을 이어서 넣는다. 같은 URL이 다른 날짜에 다시 등장해도 날짜별 선택·본문 검증 관계를 보존한다. 후보 전체는 검색·검토용으로 유지하되, 공개본은 브리핑 명시 기사와 `publication_eligible=true`·`body_status=본문 검증 완료`·구체적 근거·검증 시각을 모두 갖춘 후보만 기존 방식으로 묶어 싣는다.
 2. `ingest` 실행 후 신규/중복 건수를 사용자에게 보고한다. 중복은 clean_url 기준이며 조용히 버리지 않고 건수로 알린다.
 3. 조회 요청은 `search` 필터(키워드·날짜·목록구분·매체·읽음·보관·관심)로 답하고, 기사 ID를 함께 보여줘 후속 `mark`가 가능하게 한다.
 4. `group`으로 선별된 기사끼리만 동일보도를 묶고 제목 기반 유형·교육 분야를 자동 분류한다. 이슈 요약은 담당자가 검토·작성하며 기사에 없는 사실을 추가하지 않는다.
