@@ -4,6 +4,8 @@ import json
 import sys
 import tempfile
 import unittest
+from contextlib import redirect_stderr, redirect_stdout
+from io import StringIO
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "scripts"))
@@ -71,6 +73,53 @@ https://newstown.co.kr/news/articleView.html?idxno=710131
         self.assertEqual(list_type, "인천교육")
         self.assertEqual(len(articles), 1)
         self.assertEqual(articles[0]["publisher"], "뉴스타운")
+
+    def test_extracts_report_date_metadata_used_by_current_runner(self):
+        text = """# 인천교육청 언론보도 현황
+
+- 보고일: 2026-08-19
+- 점검 창: 2026-08-18 05:00 ~ 2026-08-19 05:00 (Asia/Seoul)
+
+## 주요 언론보도
+
+■ 인천교육청, 교육정책 간담회 개최 - 예시매체
+https://example.com/report-date
+"""
+        batch_date, list_type, articles = newsdb.parse_briefing_md(text)
+        self.assertEqual(batch_date, "2026-08-19")
+        self.assertEqual(list_type, "인천교육")
+        self.assertEqual(len(articles), 1)
+        self.assertEqual(articles[0]["publisher"], "예시매체")
+
+    def test_ingest_cli_fails_when_briefing_date_is_missing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            briefing = root / "briefing.md"
+            database = root / "news.db"
+            briefing.write_text(
+                "# 인천교육청 언론보도 현황\n\n"
+                "## 주요 언론보도\n\n"
+                "■ 날짜 없는 기사 - 예시매체\n"
+                "https://example.com/no-date\n",
+                encoding="utf-8",
+            )
+
+            stdout, stderr = StringIO(), StringIO()
+            with redirect_stdout(stdout), redirect_stderr(stderr):
+                with self.assertRaises(SystemExit) as raised:
+                    newsdb.main([
+                        "--db", str(database),
+                        "ingest", "--briefing", str(briefing),
+                    ])
+
+            self.assertEqual(raised.exception.code, 2)
+            self.assertIn("날짜 헤더", stderr.getvalue())
+            conn = newsdb.open_db(str(database))
+            self.assertEqual(
+                conn.execute("SELECT COUNT(*) FROM source_batches").fetchone()[0],
+                0,
+            )
+            conn.close()
 
 
 class TestParsePaste(unittest.TestCase):
@@ -224,6 +273,7 @@ class TestParseCollectedJson(unittest.TestCase):
                 "publisher": "검증매체",
                 "original_url": "https://a.kr/student",
                 "relevance_hint": "likely_relevant",
+                "publication_eligible": False,
                 "relevance_reasons": ["incheon_location", "education_subject"],
                 "location_hits": ["남동구"],
                 "education_subject_hits": ["중학생"],
@@ -242,8 +292,59 @@ class TestParseCollectedJson(unittest.TestCase):
             )
             row = newsdb.search_articles(conn, q="중학생")[0]
             self.assertEqual(row["relevance_hint"], "likely_relevant")
+            self.assertEqual(row["publication_eligible"], 0)
             self.assertEqual(json.loads(row["location_hits"]), ["남동구"])
             self.assertEqual(json.loads(row["student_story_hits"]), ["구조"])
+            conn.close()
+
+
+    def test_candidate_publication_requires_explicit_verification(self):
+        self.assertFalse(newsdb.is_publishable_for_digest({
+            "source_kind": "collector-json",
+            "relevance_hint": "likely_relevant",
+            "publication_eligible": False,
+        }))
+        self.assertTrue(newsdb.is_publishable_for_digest({
+            "source_kind": "collector-json",
+            "relevance_hint": "likely_relevant",
+            "publication_eligible": True,
+        }))
+        self.assertTrue(newsdb.is_publishable_for_digest({
+            "source_kind": "briefing-md",
+            "relevance_hint": "likely_irrelevant",
+            "publication_eligible": False,
+        }))
+
+    def test_verified_candidate_persists_body_evidence_metadata(self):
+        payload = {
+            "window_end": "2026-08-20 05:00",
+            "articles": [{
+                "title": "인천교육청, 학교 안전 협력 확인",
+                "publisher": "검증매체",
+                "original_url": "https://a.kr/verified",
+                "relevance_hint": "needs_review",
+                "publication_eligible": True,
+                "body_status": "본문 검증 완료",
+                "publication_verification_basis": "본문에 인천교육청과 학교 안전 협력이 명시됨",
+                "publication_verified_at": "2026-08-20T00:00:00+00:00",
+            }],
+        }
+        batch_date, list_type, articles = newsdb.parse_collected_json(
+            json.dumps(payload, ensure_ascii=False)
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            conn = newsdb.open_db(str(Path(tmp) / "verified.db"))
+            newsdb.ingest_articles(
+                conn, batch_date, list_type, articles,
+                source_kind="collector-json", raw_text="verified"
+            )
+            row = newsdb.search_articles(conn, date=batch_date, selected=True)[0]
+            self.assertEqual(row["publication_eligible"], 1)
+            self.assertEqual(row["body_status"], "본문 검증 완료")
+            self.assertIn("학교 안전 협력", row["publication_verification_basis"])
+            self.assertEqual(
+                row["publication_verified_at"], "2026-08-20T00:00:00+00:00"
+            )
             conn.close()
 
 

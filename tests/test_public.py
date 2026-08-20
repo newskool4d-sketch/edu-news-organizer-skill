@@ -180,6 +180,10 @@ class TestPublicationContract(unittest.TestCase):
             newsdb.PUBLISHABLE_CANDIDATE_STATUSES,
         )
         self.assertEqual(
+            contract["ingestion"]["publish_candidate_requires"],
+            ["publication_eligible"],
+        )
+        self.assertEqual(
             contract["layout"]["sections_in_order"],
             ["오늘의 핵심 이슈", "전체 기사", "타 시도·일반 교육 동향"],
         )
@@ -188,6 +192,10 @@ class TestPublicationContract(unittest.TestCase):
             "render_when_non_empty",
         )
         self.assertEqual(contract["article_type_order"], newsdb.TYPE_ORDER)
+        self.assertEqual(
+            contract["ingestion"]["release_required_checks"],
+            ["briefing-vs-published-content-parity"],
+        )
 
     def test_validator_accepts_current_approved_public_shape(self):
         contract = publish_site.load_publication_contract()
@@ -221,6 +229,117 @@ class TestPublicationContract(unittest.TestCase):
         )
         with self.assertRaisesRegex(ValueError, "섹션 순서"):
             publish_site.validate_publication_contract(html, contract)
+
+    def test_briefing_parity_keeps_explicit_irrelevant_article(self):
+        article = {
+            "title": "인천시교육감 선거 식사 제공·불법 선거운동 드러나",
+            "original_url": "https://www.heraldk.com/article/2026081300230428560",
+        }
+        publish_site.validate_briefing_published_content_parity(
+            [article],
+            '<a href="https://www.heraldk.com/article/2026081300230428560">기사</a>',
+        )
+
+    def test_briefing_parity_uses_title_fallback_for_grouped_url(self):
+        article = {
+            "title": "인천교육감 선거 식사 제공·불법 선거운동 드러나",
+            "original_url": "https://briefing.example/original",
+        }
+        publish_site.validate_briefing_published_content_parity(
+            [article],
+            '<a href="https://other.example/representative">인천교육감 선거 식사 제공 불법 선거운동</a>',
+        )
+
+    def test_briefing_parity_rejects_missing_article(self):
+        with self.assertRaisesRegex(ValueError, "브리핑-공개 콘텐츠 정합성"):
+            publish_site.validate_briefing_published_content_parity(
+                [{"title": "누락된 브리핑 기사", "original_url": "https://missing.example/a"}],
+                '<main>다른 기사</main>',
+            )
+
+    def test_build_runs_briefing_parity_against_generated_archive(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "news.db"
+            site = Path(tmp) / "site"
+            conn = newsdb.open_db(str(db_path))
+            briefing = [{
+                "title": "인천시교육감 선거 식사 제공·불법 선거운동 드러나",
+                "publisher": "헤럴드경제 미주판",
+                "original_url": "https://www.heraldk.com/article/2026081300230428560",
+            }]
+            candidates = [{
+                "title": "인천교육청, 별도 후보 기사",
+                "publisher": "예시매체",
+                "original_url": "https://example.com/candidate",
+                "relevance_hint": "likely_relevant",
+                "publication_eligible": True,
+            }]
+            newsdb.ingest_articles(
+                conn, "2026-08-13", "인천교육", briefing,
+                source_kind="briefing-md", raw_text="briefing",
+            )
+            newsdb.ingest_articles(
+                conn, "2026-08-13", "인천교육", candidates,
+                source_kind="collector-json", raw_text="collector",
+            )
+            conn.close()
+
+            with mock.patch(
+                "publish_site.validate_briefing_published_content_parity",
+                wraps=publish_site.validate_briefing_published_content_parity,
+            ) as parity:
+                publish_site.build(site, "2026-08-13", str(db_path))
+
+            parity.assert_called_once()
+            self.assertEqual(
+                parity.call_args.args[0],
+                [{
+                    "title": briefing[0]["title"],
+                    "original_url": briefing[0]["original_url"],
+                }],
+            )
+            self.assertIn(
+                briefing[0]["original_url"],
+                (site / "archive" / "2026-08-13.html").read_text(encoding="utf-8"),
+            )
+
+    def test_build_rejects_missing_duplicate_group_generation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "news.db"
+            site = Path(tmp) / "site"
+            conn = newsdb.open_db(str(db_path))
+            title = "인천교육청, 기초학력 담당자 역량 강화 연수 개최"
+            newsdb.ingest_articles(
+                conn, "2026-08-18", "인천교육",
+                [{
+                    "title": title,
+                    "publisher": "브리핑매체",
+                    "original_url": "https://example.com/briefing",
+                }],
+                source_kind="briefing-md", raw_text="briefing",
+            )
+            newsdb.ingest_articles(
+                conn, "2026-08-18", "인천교육",
+                [{
+                    "title": title,
+                    "publisher": "후보매체",
+                    "original_url": "https://example.com/candidate",
+                    "relevance_hint": "likely_relevant",
+                    "publication_eligible": True,
+                }],
+                source_kind="collector-json", raw_text="collector",
+            )
+            conn.close()
+
+            with self.assertRaisesRegex(ValueError, "동일보도 묶음"):
+                publish_site.build(site, "2026-08-18", str(db_path))
+
+            conn = newsdb.open_db(str(db_path))
+            self.assertEqual(newsdb.build_groups(conn, "2026-08-18"), 1)
+            conn.close()
+            publish_site.build(site, "2026-08-18", str(db_path))
+            html = (site / "archive" / "2026-08-18.html").read_text(encoding="utf-8")
+            self.assertIn("오늘의 핵심 이슈", html)
 
     def test_ingestion_validator_blocks_candidate_allowlist_drift(self):
         contract = publish_site.load_publication_contract()

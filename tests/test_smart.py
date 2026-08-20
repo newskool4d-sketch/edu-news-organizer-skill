@@ -112,6 +112,7 @@ class TestGrouping(unittest.TestCase):
             "original_url": "https://candidate.example/article",
             "published_at": "2026-07-15 08:00",
             "relevance_hint": "likely_relevant",
+            "publication_eligible": True,
         }]
         newsdb.ingest_articles(
             conn, "2026-07-15", "인천교육", briefing,
@@ -157,6 +158,7 @@ class TestGrouping(unittest.TestCase):
                 "original_url": "https://candidate.example/sintri",
                 "published_at": "2026-07-15 08:00",
                 "relevance_hint": "likely_relevant",
+                "publication_eligible": True,
             },
             {
                 "title": "인천 계양도서관, 유아·어르신 하반기 평생학습 프로그램 운영",
@@ -164,6 +166,7 @@ class TestGrouping(unittest.TestCase):
                 "original_url": "https://candidate.example/gyeyang",
                 "published_at": "2026-07-15 08:10",
                 "relevance_hint": "likely_relevant",
+                "publication_eligible": True,
             },
         ]
         newsdb.ingest_articles(
@@ -213,6 +216,7 @@ class TestGrouping(unittest.TestCase):
             recurring,
             published_at="2026-08-12 07:00",
             relevance_hint="likely_relevant",
+            publication_eligible=True,
         )
         newsdb.ingest_articles(
             conn, "2026-08-11", "인천교육", [recurring],
@@ -310,12 +314,13 @@ class TestSelectedFilter(unittest.TestCase):
         conn.close()
         tmp.cleanup()
 
-    def test_collector_publishes_relevant_and_review_but_not_irrelevant(self):
+    def test_collector_publishes_only_explicitly_verified_candidates(self):
         tmp = tempfile.TemporaryDirectory()
         conn = newsdb.open_db(str(Path(tmp.name) / "triage.db"))
         pool = [
             {"title": "인천교육청 정책 점검", "publisher": "매체",
-             "original_url": "https://a.kr/relevant", "relevance_hint": "likely_relevant"},
+             "original_url": "https://a.kr/relevant", "relevance_hint": "likely_relevant",
+             "publication_eligible": True},
             {"title": "경남교육청 수업 사례", "publisher": "매체",
              "original_url": "https://a.kr/review", "relevance_hint": "needs_review"},
             {"title": "구청 폭염 냉장고 운영", "publisher": "매체",
@@ -332,7 +337,7 @@ class TestSelectedFilter(unittest.TestCase):
         rows = newsdb.search_articles(conn, date="2026-08-03", selected=True)
         self.assertEqual(
             {r["title"] for r in rows},
-            {"인천교육청 정책 점검", "경남교육청 수업 사례"},
+            {"인천교육청 정책 점검"},
         )
         self.assertEqual(len(newsdb.search_articles(conn, date="2026-08-03")), 5)
         conn.close()
@@ -351,6 +356,7 @@ class TestSelectedFilter(unittest.TestCase):
                 "publisher": "매체",
                 "original_url": "https://a.kr/legacy-candidate",
                 "relevance_hint": "likely_relevant",
+                "publication_eligible": True,
             }],
             source_kind="collector-json",
             raw_text="legacy candidates",
@@ -407,10 +413,12 @@ class TestSelectedFilter(unittest.TestCase):
         first = [
             {"title": "제거 후보", "publisher": "매체",
              "original_url": "https://a.kr/candidate-removed",
-             "relevance_hint": "likely_relevant"},
+             "relevance_hint": "likely_relevant",
+             "publication_eligible": True},
             {"title": "유지 후보", "publisher": "매체",
              "original_url": "https://a.kr/candidate-kept",
-             "relevance_hint": "needs_review"},
+             "relevance_hint": "needs_review",
+             "publication_eligible": True},
         ]
         revised = [first[1]]
 

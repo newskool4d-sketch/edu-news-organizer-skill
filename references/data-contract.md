@@ -21,6 +21,10 @@
     "published_at_kst": "2026-07-15 10:00", "queries": ["Q1:인천교육청"],
     "engine": "google-news-rss | naver-api",
     "relevance_hint": "likely_relevant | likely_irrelevant | needs_review",
+    "publication_eligible": false,
+    "body_status": "본문 미수집 | 본문 미검증 | 본문 검증 완료",
+    "publication_verification_basis": "",
+    "publication_verified_at": "",
     "relevance_reasons": ["incheon_location", "education_subject"],
     "location_hits": ["남동구"], "education_subject_hits": ["중학생"],
     "student_story_hits": ["구조"], "negative_context_hits": []
@@ -31,7 +35,9 @@
 매핑: `batch_date` = window_end의 날짜부(보고일) / `list_type` = "인천교육" 고정 /
 `original_url` 없으면 `google_url` 폴백. 관련성 힌트와 근거 배열은 기사 테이블에 JSON 문자열로 보존한다.
 `engine: naver-api` 및 모든 `collector-json` 항목은 미선별 후보라는 점에 유의하며,
-`relevance_hint`는 triage 메타데이터일 뿐 최종 포함 판단이 아니다.
+`relevance_hint`는 triage 메타데이터일 뿐 최종 포함 판단이 아니다. `publication_eligible`는
+본문 검증 표식과 구체적 근거가 있는 후보만 `true`로 승격한다. 승격된 후보는
+`body_status`, `publication_verification_basis`, `publication_verified_at`를 함께 보존한다.
 
 ## 2. 일일 브리핑 md (선별 완료본)
 
@@ -59,11 +65,12 @@ URL
 ## 공통 규칙
 
 - 후보·선별 분리: 기존 게시 흐름대로 `briefing-md` 또는 본청 `paste`를 먼저 저장하고,
-  `collector-json`을 이어서 저장해 후보 원본과 관련성 메타데이터를 보존한다.
-  날짜별 `article_selections`에는 브리핑 명시 기사와 allow-list인 `likely_relevant`·`needs_review` 후보를 기록한다.
+  `collector-json`을 이어서 저장해 후보 원본과 관련성 메타데이터를 보존한다. 본문 검증 표식으로
+  승격된 파생 JSON이 있으면 원본 JSON 대신 그 파생본을 인제스트한다.
+  날짜별 `article_selections`에는 브리핑 명시 기사와 `publication_eligible=true` 후보만 기록한다.
   같은 `clean_url`이 다른 날짜 선별본에 다시 등장해도 해당 날짜 관계와 입력 순서를 별도로 보존한다.
-- 후보 보존: `likely_irrelevant` 항목도 삭제하지 않고 내부 검색·검토용 DB에 보존한다.
-  공개 묶음·다이제스트에서는 이 항목만 제외하며, 나머지는 데이터가 있는 공개 섹션을 승인된 상대 순서로 게시한다.
+- 후보 보존: 모든 triage 상태 항목을 삭제하지 않고 내부 검색·검토용 DB에 보존한다.
+  공개 묶음·다이제스트에서는 브리핑 명시 기사 또는 `publication_eligible=true` 후보만 게시한다.
 - 관련성 메타데이터: `relevance_hint`와 근거 배열은 상류 선별을 돕는 정보다. organizer는 이를
   임의로 최종 판정하지 않고 상류 선별 결과를 명시적 상태로 소비한다.
 - 표시 순서: `교육감 → 정책·현안 → 인터뷰·기획 → 사업·성과 → 행사·모집 → 기타 → 비판·점검 → 타 시도 동향`을 유지한다.

@@ -14,13 +14,18 @@
       "collector-json"
     ],
     "preserve_all_candidates_in_database": true,
-    "publish_candidate_statuses": [
-      "likely_relevant",
-      "needs_review"
-    ],
+      "publish_candidate_statuses": [],
+      "publish_candidate_requires": [
+        "publication_eligible"
+      ],
     "always_publish_explicit_briefing_items": true,
     "exclude_candidate_statuses": [
-      "likely_irrelevant"
+      "likely_relevant",
+      "likely_irrelevant",
+      "needs_review"
+    ],
+    "release_required_checks": [
+      "briefing-vs-published-content-parity"
     ]
   },
   "layout": {

@@ -18,6 +18,7 @@ import argparse
 import html as _html
 import json
 import re
+import sqlite3
 import subprocess
 import sys
 from datetime import datetime
@@ -65,6 +66,10 @@ def validate_ingestion_contract(conn, date_iso: str, contract: dict) -> None:
         raise ValueError(
             "공개 입력 계약 위반: 후보 게시 상태 allow-list가 구현과 다릅니다."
         )
+    if contract["ingestion"].get("publish_candidate_requires") != ["publication_eligible"]:
+        raise ValueError(
+            "공개 입력 계약 위반: 후보 게시에는 publication_eligible 검증이 필요합니다."
+        )
     briefing = conn.execute(
         "SELECT MAX(batch_id) FROM source_batches WHERE batch_date = ? "
         "AND source_kind IN ('briefing-md', 'paste')", (date_iso,)
@@ -76,6 +81,36 @@ def validate_ingestion_contract(conn, date_iso: str, contract: dict) -> None:
     if briefing is None or collector is None or briefing >= collector:
         raise ValueError(
             "공개 입력 순서 위반: briefing-md를 먼저, collector-json을 다음에 넣어야 합니다."
+        )
+
+
+def _group_memberships(conn, date_iso: str) -> tuple:
+    groups = {}
+    for group_id, article_id in conn.execute(
+            "SELECT g.group_id, i.article_id FROM article_groups g "
+            "JOIN article_group_items i ON i.group_id = g.group_id "
+            "WHERE g.batch_date = ? ORDER BY g.group_id, i.article_id",
+            (date_iso,)):
+        groups.setdefault(group_id, []).append(article_id)
+    return tuple(sorted(tuple(sorted(article_ids)) for article_ids in groups.values()))
+
+
+def validate_grouping_state(conn, date_iso: str) -> None:
+    """현재 DB의 동일보도 묶음이 최신 선별 관계와 일치하는지 확인한다."""
+    actual = _group_memberships(conn, date_iso)
+    scratch = sqlite3.connect(":memory:")
+    scratch.row_factory = sqlite3.Row
+    try:
+        conn.backup(scratch)
+        newsdb.build_groups(scratch, date_iso)
+        expected = _group_memberships(scratch, date_iso)
+    finally:
+        scratch.close()
+    if actual != expected:
+        raise ValueError(
+            "동일보도 묶음 상태 불일치: "
+            f"newsdb.py group --date {date_iso} 실행 후 다시 게시하세요 "
+            f"(현재 {len(actual)}개, 예상 {len(expected)}개)."
         )
 
 
@@ -106,6 +141,41 @@ def validate_publication_contract(html: str, contract: dict) -> None:
     for forbidden in contract["public_safety"]["forbidden_text"]:
         if forbidden in body:
             raise ValueError(f"공개 안전 위반: 금지 문구 노출 - {forbidden}")
+
+
+def _normalize_url(url: str) -> str:
+    return (url or "").strip().rstrip("/")
+
+
+def _title_keywords(title: str) -> set:
+    tokens = re.findall(r"[가-힣A-Za-z0-9]{2,}", title or "")
+    return {token for token in tokens if token not in {"인천", "교육청", "인천시"}}
+
+
+def validate_briefing_published_content_parity(briefing_articles: list, published_html: str) -> None:
+    """브리핑 명시 기사가 공개 HTML에 남았는지 URL 우선·제목 보조로 확인한다.
+
+    동일보도 묶음은 대표 URL이 달라질 수 있으므로 URL이 없을 때 제목 핵심어가
+    모두 공개 HTML에 존재하는지 2차 확인한다. 두 방식 모두 실패하면 release를 중단한다.
+    """
+    missing = []
+    html_lower = (published_html or "").lower()
+    for article in briefing_articles:
+        url = _normalize_url(article.get("original_url") or article.get("url"))
+        if url and url.lower() in html_lower:
+            continue
+        keywords = _title_keywords(article.get("title", ""))
+        matched_keywords = {
+            keyword for keyword in keywords if keyword.lower() in html_lower
+        }
+        if (len(matched_keywords) >= 2
+                and len(matched_keywords) / len(keywords) >= 0.6):
+            continue
+        missing.append(article.get("title") or url or "(제목·URL 없음)")
+    if missing:
+        raise ValueError(
+            "브리핑-공개 콘텐츠 정합성 위반: " + "; ".join(missing[:5])
+        )
 
 
 def _fmt(date_iso: str) -> str:
@@ -275,10 +345,23 @@ def build(site_dir: Path, date_iso: str = None, db_path: str = None):
     if date_iso:
         contract = load_publication_contract()
         conn = newsdb.open_db(db_path)
-        validate_ingestion_contract(conn, date_iso, contract)
-        html = newsdb.render_digest_html(newsdb.build_digest_data(conn, date_iso), public=True)
-        conn.close()
-        validate_publication_contract(html, contract)
+        try:
+            validate_ingestion_contract(conn, date_iso, contract)
+            validate_grouping_state(conn, date_iso)
+            html = newsdb.render_digest_html(newsdb.build_digest_data(conn, date_iso), public=True)
+            validate_publication_contract(html, contract)
+            briefing_articles = [
+                dict(row) for row in conn.execute(
+                    "SELECT DISTINCT a.title, a.original_url "
+                    "FROM articles a JOIN article_selections s ON s.article_id = a.article_id "
+                    "WHERE s.batch_date = ? AND s.source_kind IN ('briefing-md', 'paste') "
+                    "ORDER BY s.input_order, a.article_id",
+                    (date_iso,),
+                ).fetchall()
+            ]
+            validate_briefing_published_content_parity(briefing_articles, html)
+        finally:
+            conn.close()
         (site_dir / "archive" / f"{date_iso}.html").write_text(html, encoding="utf-8", newline="\n")
 
     dates = sorted(set(existing_dates(site_dir)), reverse=True)

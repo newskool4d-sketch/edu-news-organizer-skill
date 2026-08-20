@@ -27,6 +27,8 @@ DATE_HEADER_RE = re.compile(
     r"^(20\d{2})\.\s*(\d{1,2})\.\s*(\d{1,2})\.\s*\(.\)\s*(.+?)\s*주요 언론보도 현황입니다")
 DATE_ONLY_RE = re.compile(
     r"^(20\d{2})\.\s*(\d{1,2})\.\s*(\d{1,2})\.\s*\([^)]*\)\s*$")
+REPORT_DATE_RE = re.compile(
+    r"^(?:[-*]\s*)?보고일\s*:\s*(20\d{2})[-./]\s*(\d{1,2})[-./]\s*(\d{1,2})\s*$")
 ARTICLE_LINE_RE = re.compile(r"^■\s+(.+)$")
 
 
@@ -125,7 +127,17 @@ def classify_fields(title: str) -> list:
 
 
 DIGEST_SOURCE_PRIORITY = ("briefing-md", "paste")
-PUBLISHABLE_CANDIDATE_STATUSES = frozenset({"likely_relevant", "needs_review"})
+# relevance_hint는 수집·검토용 triage 값이다. 후보는 본문 검증 후
+# publication_eligible=True로 명시 승격된 경우에만 공개한다.
+PUBLISHABLE_CANDIDATE_STATUSES = frozenset()
+
+
+def is_publishable_for_digest(article: dict) -> bool:
+    """명시 브리핑 또는 본문 검증을 명시한 후보만 공개 대상으로 유지한다."""
+    if article.get("source_kind") in DIGEST_SOURCE_PRIORITY:
+        return True
+    # SQLite INTEGER 컬럼은 조회 시 0/1로 돌아오므로 Python bool과 함께 허용한다.
+    return article.get("publication_eligible") in (True, 1)
 
 
 def _selection_source_rank(source_kind: str) -> int:
@@ -274,6 +286,11 @@ def _date_only_to_batch(m: re.Match):
     return f"{m.group(1)}-{int(m.group(2)):02d}-{int(m.group(3)):02d}", "인천교육"
 
 
+def _report_date_to_batch(m: re.Match):
+    """daily-news-picker의 `보고일: YYYY-MM-DD` 메타데이터 → 인천교육 배치 날짜."""
+    return f"{m.group(1)}-{int(m.group(2)):02d}-{int(m.group(3)):02d}", "인천교육"
+
+
 def _parse_share_lines(lines: list) -> list:
     """`■ 제목 - 매체` 다음 줄 URL 형식의 기사 목록을 파싱한다."""
     articles = []
@@ -306,6 +323,12 @@ def parse_briefing_md(text: str):
         if m:
             batch_date, list_type = _header_to_batch(m)
             break
+    if not batch_date:
+        for line in lines:
+            m = REPORT_DATE_RE.match(line.strip())
+            if m:
+                batch_date, list_type = _report_date_to_batch(m)
+                break
     if not batch_date:
         for index, line in enumerate(lines):
             if line.strip() != "## 보도일":
@@ -354,9 +377,13 @@ def parse_collected_json(text: str):
             "publisher_domain": a.get("publisher_domain", ""),
             "original_url": a.get("original_url") or a.get("google_url") or "",
             "published_at": a.get("published_at_kst", ""),
+            "body_status": a.get("body_status", "본문 미수집"),
             "engine": a.get("engine", ""),
             "queries": ",".join(a.get("queries", [])),
             "relevance_hint": a.get("relevance_hint", ""),
+            "publication_eligible": a.get("publication_eligible") is True,
+            "publication_verification_basis": a.get("publication_verification_basis", ""),
+            "publication_verified_at": a.get("publication_verified_at", ""),
             "relevance_reasons": a.get("relevance_reasons", []),
             "location_hits": a.get("location_hits", []),
             "education_subject_hits": a.get("education_subject_hits", []),
@@ -390,6 +417,8 @@ CREATE TABLE IF NOT EXISTS articles (
     clean_url TEXT NOT NULL UNIQUE,
     published_at TEXT DEFAULT '',
     body_status TEXT DEFAULT '본문 미수집',
+    publication_verification_basis TEXT DEFAULT '',
+    publication_verified_at TEXT DEFAULT '',
     engine TEXT DEFAULT '',
     queries TEXT DEFAULT '',
     relevance_hint TEXT DEFAULT '',
@@ -398,6 +427,7 @@ CREATE TABLE IF NOT EXISTS articles (
     education_subject_hits TEXT DEFAULT '[]',
     student_story_hits TEXT DEFAULT '[]',
     negative_context_hits TEXT DEFAULT '[]',
+    publication_eligible INTEGER NOT NULL DEFAULT 0,
     selected_for_digest INTEGER NOT NULL DEFAULT 0,
     input_order INTEGER DEFAULT 0,
     collected_at TEXT NOT NULL
@@ -498,6 +528,9 @@ def open_db(db_path: str = None) -> sqlite3.Connection:
         "education_subject_hits": "TEXT DEFAULT '[]'",
         "student_story_hits": "TEXT DEFAULT '[]'",
         "negative_context_hits": "TEXT DEFAULT '[]'",
+        "publication_eligible": "INTEGER NOT NULL DEFAULT 0",
+        "publication_verification_basis": "TEXT DEFAULT ''",
+        "publication_verified_at": "TEXT DEFAULT ''",
     }
     for name, definition in metadata_columns.items():
         if name not in cols:
@@ -511,15 +544,30 @@ def open_db(db_path: str = None) -> sqlite3.Connection:
             "a.input_order, a.collected_at FROM articles a JOIN source_batches sb ON sb.batch_id = a.batch_id "
             "WHERE sb.source_kind IN ('briefing-md', 'paste')"
         )
-        publishable_statuses = tuple(sorted(PUBLISHABLE_CANDIDATE_STATUSES))
-        marks = ",".join("?" for _ in publishable_statuses)
-        conn.execute(
-            "INSERT OR IGNORE INTO article_selections(article_id, batch_date, list_type, source_kind, "
-            "input_order, selected_at) SELECT a.article_id, a.batch_date, a.list_type, sb.source_kind, "
-            "a.input_order, a.collected_at FROM articles a JOIN source_batches sb ON sb.batch_id = a.batch_id "
-            f"WHERE sb.source_kind = 'collector-json' AND a.relevance_hint IN ({marks})",
-            publishable_statuses,
-        )
+        if PUBLISHABLE_CANDIDATE_STATUSES:
+            publishable_statuses = tuple(sorted(PUBLISHABLE_CANDIDATE_STATUSES))
+            marks = ",".join("?" for _ in publishable_statuses)
+            conn.execute(
+                "INSERT OR IGNORE INTO article_selections(article_id, batch_date, list_type, source_kind, "
+                "input_order, selected_at) SELECT a.article_id, a.batch_date, a.list_type, sb.source_kind, "
+                "a.input_order, a.collected_at FROM articles a JOIN source_batches sb ON sb.batch_id = a.batch_id "
+                f"WHERE sb.source_kind = 'collector-json' AND a.publication_eligible = 1 "
+                f"AND a.relevance_hint IN ({marks})",
+                publishable_statuses,
+            )
+        else:
+            # 현재 계약은 triage 상태와 무관하게 본문 검증 플래그만 승격 근거로 삼는다.
+            conn.execute(
+                "INSERT OR IGNORE INTO article_selections(article_id, batch_date, list_type, source_kind, "
+                "input_order, selected_at) SELECT a.article_id, a.batch_date, a.list_type, sb.source_kind, "
+                "a.input_order, a.collected_at FROM articles a JOIN source_batches sb ON sb.batch_id = a.batch_id "
+                "WHERE sb.source_kind = 'collector-json' AND a.publication_eligible = 1"
+            )
+    # 기존 DB의 collector-json 선별 관계는 본문 검증 플래그가 없으므로 공개하지 않는다.
+    conn.execute(
+        "DELETE FROM article_selections WHERE source_kind = 'collector-json' "
+        "AND article_id IN (SELECT article_id FROM articles WHERE publication_eligible = 0)"
+    )
     conn.execute(
         "UPDATE articles SET selected_for_digest = CASE WHEN EXISTS "
         "(SELECT 1 FROM article_selections s WHERE s.article_id = articles.article_id) "
@@ -567,25 +615,33 @@ def ingest_articles(conn, batch_date, list_type, articles, source_kind, raw_text
         if not url:
             continue
         title = a.get("title", "")
-        publishable = (
-            source_kind in DIGEST_SOURCE_PRIORITY
-            or (source_kind == "collector-json"
-                and a.get("relevance_hint", "") in PUBLISHABLE_CANDIDATE_STATUSES)
+        body_status = str(a.get("body_status", "본문 미수집") or "본문 미수집").strip()
+        publication_verification_basis = str(
+            a.get("publication_verification_basis", "") or ""
+        ).strip()
+        publication_verified_at = str(a.get("publication_verified_at", "") or "").strip()
+        publication_eligible = a.get("publication_eligible") is True
+        publishable = is_publishable_for_digest(
+            {"source_kind": source_kind,
+             "relevance_hint": a.get("relevance_hint", ""),
+             "publication_eligible": publication_eligible}
         )
         cur = conn.execute(
             "INSERT OR IGNORE INTO articles(batch_id, batch_date, list_type, title, publisher, "
-            "publisher_domain, original_url, clean_url, published_at, engine, queries, "
+            "publisher_domain, original_url, clean_url, published_at, body_status, "
+            "publication_verification_basis, publication_verified_at, engine, queries, "
             "relevance_hint, relevance_reasons, location_hits, education_subject_hits, "
-            "student_story_hits, negative_context_hits, selected_for_digest, input_order, "
+            "student_story_hits, negative_context_hits, publication_eligible, selected_for_digest, input_order, "
             "collected_at, article_type, edu_fields) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (batch_id, batch_date, list_type, title, a.get("publisher", ""),
              a.get("publisher_domain", "") or urllib.parse.urlsplit(url).netloc,
-             url, clean_url(url), a.get("published_at", ""), a.get("engine", ""),
-             a.get("queries", ""), a.get("relevance_hint", ""),
+             url, clean_url(url), a.get("published_at", ""), body_status,
+             publication_verification_basis, publication_verified_at,
+             a.get("engine", ""), a.get("queries", ""), a.get("relevance_hint", ""),
              _json_list(a.get("relevance_reasons")), _json_list(a.get("location_hits")),
              _json_list(a.get("education_subject_hits")), _json_list(a.get("student_story_hits")),
-             _json_list(a.get("negative_context_hits")), int(publishable), order, _now(),
+             _json_list(a.get("negative_context_hits")), int(publication_eligible), int(publishable), order, _now(),
              classify_type(title), ",".join(classify_fields(title))))
         article_id = None
         if cur.rowcount == 1:
@@ -623,10 +679,13 @@ def ingest_articles(conn, batch_date, list_type, articles, source_kind, raw_text
                 conn.execute(
                     "UPDATE articles SET relevance_hint = ?, relevance_reasons = ?, location_hits = ?, "
                     "education_subject_hits = ?, student_story_hits = ?, negative_context_hits = ?, "
-                    "article_type = ?, edu_fields = ? WHERE article_id = ?",
+                    "publication_eligible = ?, body_status = ?, publication_verification_basis = ?, "
+                    "publication_verified_at = ?, article_type = ?, edu_fields = ? WHERE article_id = ?",
                     (a.get("relevance_hint", ""), _json_list(a.get("relevance_reasons")),
                      _json_list(a.get("location_hits")), _json_list(a.get("education_subject_hits")),
                      _json_list(a.get("student_story_hits")), _json_list(a.get("negative_context_hits")),
+                     int(publication_eligible), body_status, publication_verification_basis,
+                     publication_verified_at,
                      classify_type(title), ",".join(classify_fields(title)), existing["article_id"])
                 )
         if publishable and article_id:
@@ -854,15 +913,30 @@ def build_digest_data(conn, batch_date: str) -> dict:
 
     인천 뉴스(hero_issues·all_by_type)와 타시도·일반교육 뉴스(other_issues·other_articles)를 분리한다.
     묶음은 구성 기사 중 한 건이라도 검증된 인천 입력이거나 제목 근거가 있으면 인천으로 분류.
-    원시 후보는 DB에 보존한다. 공개 묶음·다이제스트는 관련성 판정이
-    `likely_relevant`·`needs_review`인 후보와 브리핑 명시 기사의 합집합만 사용한다.
+    원시 후보는 DB에 보존한다. 공개 묶음·다이제스트는 브리핑 명시 기사와
+    `publication_eligible`가 명시된 후보만 사용한다.
     TYPE_ORDER는 사용자가 정한 정무적 표시 순서를 그대로 유지한다.
     """
-    rows = search_articles(conn, date=batch_date, selected=True, limit=2000)
+    rows = [
+        row for row in search_articles(conn, date=batch_date, selected=True, limit=2000)
+        if is_publishable_for_digest(row)
+    ]
     candidate_total = conn.execute(
         "SELECT COUNT(*) FROM articles WHERE batch_date = ?", (batch_date,)
     ).fetchone()[0]
-    groups = list_groups(conn, batch_date)
+    publishable_ids = {row["article_id"] for row in rows}
+    groups = []
+    for original_group in list_groups(conn, batch_date):
+        members = [m for m in original_group["members"] if m["article_id"] in publishable_ids]
+        # 비공개 후보만 남은 그룹은 버리고, 한 건만 남은 그룹은 일반 기사로 되돌린다.
+        if len(members) < 2:
+            continue
+        group = dict(original_group)
+        group["members"] = members
+        group["member_count"] = len(members)
+        if group["representative_article_id"] not in publishable_ids:
+            group["representative_article_id"] = members[0]["article_id"]
+        groups.append(group)
     grouped_ids = {m["article_id"] for g in groups for m in g["members"]}
 
     hero_issues, other_issues = [], []
@@ -1108,12 +1182,24 @@ def main(argv=None):
             text = Path(args.paste).read_text(encoding="utf-8")
             batches = parse_paste(text)
             kind = "paste"
+        ingested_batches = 0
+        invalid_batches = 0
         for batch_date, list_type, articles in batches:
             if not batch_date:
-                print("경고: 날짜 헤더를 찾지 못해 이 배치를 건너뜁니다.")
+                print(
+                    "오류: 날짜 헤더를 찾지 못해 인제스트를 중단합니다.",
+                    file=sys.stderr,
+                )
+                invalid_batches += 1
                 continue
             new, dup = ingest_articles(conn, batch_date, list_type, articles, kind, text)
+            ingested_batches += 1
             print(f"[{batch_date}/{list_type}] 신규 {new}건, 중복 {dup}건 (입력 {len(articles)}건)")
+        if invalid_batches or not ingested_batches:
+            if not invalid_batches:
+                print("오류: 인제스트할 유효한 배치를 찾지 못했습니다.", file=sys.stderr)
+            conn.close()
+            raise SystemExit(2)
 
     elif args.cmd == "search":
         rows = search_articles(conn, q=args.q, date=args.date, list_type=args.list_type,
