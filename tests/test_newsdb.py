@@ -91,6 +91,22 @@ https://example.com/report-date
         self.assertEqual(len(articles), 1)
         self.assertEqual(articles[0]["publisher"], "예시매체")
 
+    def test_extracts_report_date_metadata_with_korean_weekday(self):
+        text = """# 인천교육청 언론보도 현황
+
+- 보고일: 2026. 8. 21.(금)
+- 점검 범위: 2026-08-20 05:00 ~ 2026-08-21 05:00 (Asia/Seoul)
+
+## 주요 언론보도
+
+■ 인천교육청, 교육정책 간담회 개최 - 예시매체
+https://example.com/report-date-weekday
+"""
+        batch_date, list_type, articles = newsdb.parse_briefing_md(text)
+        self.assertEqual(batch_date, "2026-08-21")
+        self.assertEqual(list_type, "인천교육")
+        self.assertEqual(len(articles), 1)
+
     def test_ingest_cli_fails_when_briefing_date_is_missing(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -298,23 +314,20 @@ class TestParseCollectedJson(unittest.TestCase):
             conn.close()
 
 
-    def test_candidate_publication_requires_explicit_verification(self):
-        self.assertFalse(newsdb.is_publishable_for_digest({
+    def test_candidate_publication_uses_aug20_relevance_allowlist(self):
+        self.assertTrue(newsdb.is_publishable_for_digest({
             "source_kind": "collector-json",
             "relevance_hint": "likely_relevant",
             "publication_eligible": False,
         }))
-        self.assertFalse(newsdb.is_publishable_for_digest({
-            "source_kind": "collector-json",
-            "relevance_hint": "likely_relevant",
-            "publication_eligible": True,
-            "body_status": "본문 미검증",
-            "publication_verification_basis": "",
-            "publication_verified_at": "",
-        }))
         self.assertTrue(newsdb.is_publishable_for_digest({
             "source_kind": "collector-json",
-            "relevance_hint": "likely_relevant",
+            "relevance_hint": "needs_review",
+            "publication_eligible": False,
+        }))
+        self.assertFalse(newsdb.is_publishable_for_digest({
+            "source_kind": "collector-json",
+            "relevance_hint": "likely_irrelevant",
             "publication_eligible": True,
             "body_status": "본문 검증 완료",
             "publication_verification_basis": "본문에서 확인한 구체적 기관·사실 근거",
@@ -358,7 +371,7 @@ class TestParseCollectedJson(unittest.TestCase):
             )
             conn.close()
 
-    def test_unverified_true_candidate_is_not_selected_or_published(self):
+    def test_candidate_without_allowlisted_relevance_is_not_selected_or_published(self):
         with tempfile.TemporaryDirectory() as tmp:
             conn = newsdb.open_db(str(Path(tmp) / "unverified.db"))
             newsdb.ingest_articles(
@@ -385,7 +398,7 @@ class TestParseCollectedJson(unittest.TestCase):
             )
             self.assertEqual(
                 conn.execute("SELECT publication_eligible FROM articles").fetchone()[0],
-                0,
+                1,
             )
             conn.close()
 

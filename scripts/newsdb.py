@@ -28,7 +28,8 @@ DATE_HEADER_RE = re.compile(
 DATE_ONLY_RE = re.compile(
     r"^(20\d{2})\.\s*(\d{1,2})\.\s*(\d{1,2})\.\s*\([^)]*\)\s*$")
 REPORT_DATE_RE = re.compile(
-    r"^(?:[-*]\s*)?보고일\s*:\s*(20\d{2})[-./]\s*(\d{1,2})[-./]\s*(\d{1,2})\s*$")
+    r"^(?:[-*]\s*)?보고일\s*:\s*(20\d{2})\s*[-./]\s*(\d{1,2})\s*[-./]\s*"
+    r"(\d{1,2})(?:\s*\.?\s*\([^)]*\))?\s*$")
 ARTICLE_LINE_RE = re.compile(r"^■\s+(.+)$")
 
 
@@ -127,15 +128,10 @@ def classify_fields(title: str) -> list:
 
 
 DIGEST_SOURCE_PRIORITY = ("briefing-md", "paste")
-# relevance_hint는 수집·검토용 triage 값이다. 후보는 본문 검증 후
-# publication_eligible=True로 명시 승격된 경우에만 공개한다.
-PUBLISHABLE_CANDIDATE_STATUSES = frozenset()
-PUBLICATION_REQUIRED_FIELDS = [
-    "publication_eligible",
-    "body_status",
-    "publication_verification_basis",
-    "publication_verified_at",
-]
+# 8월 20일 공개본과 동일하게, 수집 후보는 관련성 triage allow-list를 따른다.
+# 원문·본문 검증 메타데이터는 계속 저장하지만 공개 선별의 차단 기준으로 사용하지 않는다.
+PUBLISHABLE_CANDIDATE_STATUSES = frozenset({"likely_relevant", "needs_review"})
+PUBLICATION_REQUIRED_FIELDS = ["relevance_hint"]
 VERIFIED_BODY_STATUS = "본문 검증 완료"
 # 구체성 자체는 사람이 확인하고, 저장 게이트는 빈 근거만 차단한다.
 # 임의의 문자 수 제한으로 유효한 짧은 근거를 잃지 않도록 한다.
@@ -174,10 +170,14 @@ def has_publication_verification(article: dict) -> bool:
 
 
 def is_publishable_for_digest(article: dict) -> bool:
-    """명시 브리핑 또는 본문 검증을 명시한 후보만 공개 대상으로 유지한다."""
+    """명시 브리핑 또는 8월 20일 기준 관련성 후보를 공개 대상으로 유지한다."""
     if article.get("source_kind") in DIGEST_SOURCE_PRIORITY:
         return True
-    return has_publication_verification(article)
+    relevance_hint = article.get(
+        "selection_relevance_hint",
+        article.get("relevance_hint", ""),
+    )
+    return relevance_hint in PUBLISHABLE_CANDIDATE_STATUSES
 
 
 def _selection_source_rank(source_kind: str) -> int:
@@ -327,7 +327,7 @@ def _date_only_to_batch(m: re.Match):
 
 
 def _report_date_to_batch(m: re.Match):
-    """daily-news-picker의 `보고일: YYYY-MM-DD` 메타데이터 → 인천교육 배치 날짜."""
+    """daily-news-picker의 `보고일: YYYY-MM-DD` 또는 점 표기 메타데이터 → 인천교육 배치 날짜."""
     return f"{m.group(1)}-{int(m.group(2)):02d}-{int(m.group(3)):02d}", "인천교육"
 
 
@@ -479,6 +479,7 @@ CREATE TABLE IF NOT EXISTS article_selections (
     source_kind TEXT NOT NULL,
     input_order INTEGER NOT NULL DEFAULT 0,
     selected_at TEXT NOT NULL,
+    relevance_hint TEXT DEFAULT '',
     body_status TEXT DEFAULT '',
     publication_eligible INTEGER NOT NULL DEFAULT 0,
     publication_verification_basis TEXT DEFAULT '',
@@ -596,6 +597,7 @@ def open_db(db_path: str = None) -> sqlite3.Connection:
 
     selection_columns = {r["name"] for r in conn.execute("PRAGMA table_info(article_selections)")}
     selection_metadata_columns = {
+        "relevance_hint": "TEXT DEFAULT ''",
         "body_status": "TEXT DEFAULT ''",
         "publication_eligible": "INTEGER NOT NULL DEFAULT 0",
         "publication_verification_basis": "TEXT DEFAULT ''",
@@ -604,15 +606,17 @@ def open_db(db_path: str = None) -> sqlite3.Connection:
     for name, definition in selection_metadata_columns.items():
         if name not in selection_columns:
             conn.execute(f"ALTER TABLE article_selections ADD COLUMN {name} {definition}")
+    publishable_statuses = tuple(sorted(PUBLISHABLE_CANDIDATE_STATUSES))
+    status_marks = ",".join("?" for _ in publishable_statuses)
 
-    # 관계 테이블이 처음 생기는 DB는 신뢰 가능한 명시 브리핑·본문 검증 후보만 백필한다.
+    # 관계 테이블이 처음 생기는 DB는 명시 브리핑과 8월 20일 기준 후보를 백필한다.
     if not selections_table_existed:
         conn.execute(
             "INSERT OR REPLACE INTO article_selections(article_id, batch_date, list_type, source_kind, "
-            "input_order, selected_at, body_status, publication_eligible, "
+            "input_order, selected_at, relevance_hint, body_status, publication_eligible, "
             "publication_verification_basis, publication_verified_at) "
             "SELECT a.article_id, a.batch_date, a.list_type, sb.source_kind, "
-            "a.input_order, a.collected_at, a.body_status, 1, "
+            "a.input_order, a.collected_at, a.relevance_hint, a.body_status, 1, "
             "a.publication_verification_basis, a.publication_verified_at "
             "FROM articles a JOIN source_batches sb ON sb.batch_id = a.batch_id "
             "WHERE sb.source_kind IN ('briefing-md', 'paste')"
@@ -623,26 +627,26 @@ def open_db(db_path: str = None) -> sqlite3.Connection:
         )
         conn.execute(
             "INSERT OR IGNORE INTO article_selections(article_id, batch_date, list_type, source_kind, "
-            "input_order, selected_at, body_status, publication_eligible, "
+            "input_order, selected_at, relevance_hint, body_status, publication_eligible, "
             "publication_verification_basis, publication_verified_at) "
             "SELECT a.article_id, a.batch_date, a.list_type, sb.source_kind, a.input_order, a.collected_at, "
-            "a.body_status, 1, a.publication_verification_basis, a.publication_verified_at "
+            "a.relevance_hint, a.body_status, a.publication_eligible, "
+            "a.publication_verification_basis, a.publication_verified_at "
             "FROM articles a JOIN source_batches sb ON sb.batch_id = a.batch_id "
             "WHERE sb.source_kind = 'collector-json' "
-            "AND a.publication_eligible = 1 "
-            "AND a.body_status = ? "
-            "AND LENGTH(TRIM(a.publication_verification_basis)) >= ? "
-            "AND LENGTH(TRIM(a.publication_verified_at)) > 0",
-            (VERIFIED_BODY_STATUS, MIN_VERIFICATION_BASIS_LENGTH),
+            f"AND a.relevance_hint IN ({status_marks})",
+            publishable_statuses,
         )
 
-    # 구 스키마의 collector 관계는 본문 검증 증거가 없을 수 있다.
+    # 구 스키마의 collector 관계는 본문 검증 메타데이터가 없을 수 있다.
     # 삭제하기 전에 격리 테이블로 옮겨 원본 관계와 마이그레이션 사유를 보존한다.
     legacy_rows = conn.execute(
         "SELECT s.article_id, s.batch_date, s.list_type, s.source_kind, s.input_order, s.selected_at, "
+        "s.relevance_hint AS selection_relevance_hint, "
         "s.body_status AS selection_body_status, s.publication_eligible AS selection_publication_eligible, "
         "s.publication_verification_basis AS selection_publication_verification_basis, "
         "s.publication_verified_at AS selection_publication_verified_at, "
+        "a.relevance_hint AS article_relevance_hint, "
         "a.body_status AS article_body_status, a.publication_eligible, "
         "a.publication_verification_basis, a.publication_verified_at "
         "FROM article_selections s JOIN articles a ON a.article_id = s.article_id "
@@ -665,19 +669,9 @@ def open_db(db_path: str = None) -> sqlite3.Connection:
                 row["selection_publication_verified_at"]
                 or row["publication_verified_at"]
             ),
+            "relevance_hint": row["selection_relevance_hint"] or row["article_relevance_hint"] or "",
         }
-        if has_publication_verification(candidate):
-            conn.execute(
-                "UPDATE article_selections SET body_status = ?, publication_eligible = 1, "
-                "publication_verification_basis = ?, publication_verified_at = ? "
-                "WHERE article_id = ? AND batch_date = ? AND list_type = ?",
-                (
-                    VERIFIED_BODY_STATUS,
-                    candidate["selection_publication_verification_basis"],
-                    candidate["selection_publication_verified_at"],
-                    row["article_id"], row["batch_date"], row["list_type"],
-                ),
-            )
+        if is_publishable_for_digest(candidate):
             continue
         conn.execute(
             "INSERT OR IGNORE INTO legacy_candidate_selections("
@@ -686,13 +680,46 @@ def open_db(db_path: str = None) -> sqlite3.Connection:
             (
                 row["article_id"], row["batch_date"], row["list_type"], row["source_kind"],
                 row["input_order"], row["selected_at"],
-                "기존 후보 선택 관계에 본문 검증 근거 없음", _now(),
+                "현재 공개 allow-list에 없는 기존 후보 선택 관계", _now(),
             ),
         )
         conn.execute(
             "DELETE FROM article_selections WHERE article_id = ? AND batch_date = ? AND list_type = ?",
             (row["article_id"], row["batch_date"], row["list_type"]),
         )
+
+    # 엄격 게이트에서 격리했던 후보 관계를 8월 20일 allow-list 기준으로 복원한다.
+    # legacy_candidate_selections는 감사용으로 남기고, 공개 선별 관계만 재생성한다.
+    conn.execute(
+        "INSERT OR IGNORE INTO article_selections("
+        "article_id, batch_date, list_type, source_kind, input_order, selected_at, "
+        "relevance_hint, "
+        "body_status, publication_eligible, publication_verification_basis, publication_verified_at) "
+        "SELECT l.article_id, l.batch_date, l.list_type, l.source_kind, l.input_order, "
+        "l.selected_at, a.relevance_hint, a.body_status, a.publication_eligible, "
+        "a.publication_verification_basis, a.publication_verified_at "
+        "FROM legacy_candidate_selections l JOIN articles a ON a.article_id = l.article_id "
+        "JOIN source_batches sb ON sb.batch_id = a.batch_id "
+        f"WHERE l.source_kind = 'collector-json' "
+        "AND l.reason IN (?, ?) "
+        f"AND a.relevance_hint IN ({status_marks})",
+        (
+            "기존 후보 선택 관계에 본문 검증 근거 없음",
+            "현재 공개 allow-list에 없는 기존 후보 선택 관계",
+            *publishable_statuses,
+        ),
+    )
+    conn.execute(
+        "UPDATE legacy_candidate_selections SET reason = ? "
+        "WHERE source_kind = 'collector-json' AND reason IN (?, ?) "
+        f"AND article_id IN (SELECT article_id FROM articles WHERE relevance_hint IN ({status_marks}))",
+        (
+            "8월 20일 기준 공개 선택으로 복원됨",
+            "기존 후보 선택 관계에 본문 검증 근거 없음",
+            "현재 공개 allow-list에 없는 기존 후보 선택 관계",
+            *publishable_statuses,
+        ),
+    )
 
     conn.execute(
         "UPDATE articles SET selected_for_digest = CASE WHEN EXISTS "
@@ -747,13 +774,14 @@ def ingest_articles(conn, batch_date, list_type, articles, source_kind, raw_text
         ).strip()
         publication_verified_at = str(a.get("publication_verified_at", "") or "").strip()
         requested_publication_eligible = a.get("publication_eligible") is True
-        publication_eligible = (
-            requested_publication_eligible
-            and body_status == VERIFIED_BODY_STATUS
-            and len(publication_verification_basis) >= MIN_VERIFICATION_BASIS_LENGTH
-            and bool(publication_verified_at)
+        # 본문 검증 메타데이터는 보존하되, 공개 선별은 8월 20일 기준
+        # relevance_hint allow-list로 결정한다.
+        publication_eligible = requested_publication_eligible
+        publishable = (
+            source_kind in DIGEST_SOURCE_PRIORITY
+            or (source_kind == "collector-json"
+                and a.get("relevance_hint", "") in PUBLISHABLE_CANDIDATE_STATUSES)
         )
-        publishable = source_kind in DIGEST_SOURCE_PRIORITY or publication_eligible
         cur = conn.execute(
             "INSERT OR IGNORE INTO articles(batch_id, batch_date, list_type, title, publisher, "
             "publisher_domain, original_url, clean_url, published_at, body_status, "
@@ -827,13 +855,14 @@ def ingest_articles(conn, batch_date, list_type, articles, source_kind, raw_text
                     <= _selection_source_rank(current_selection["source_kind"])):
                 conn.execute(
                     "INSERT OR REPLACE INTO article_selections(article_id, batch_date, list_type, "
-                    "source_kind, input_order, selected_at, body_status, publication_eligible, "
+                    "source_kind, input_order, selected_at, relevance_hint, body_status, publication_eligible, "
                     "publication_verification_basis, publication_verified_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (
                         article_id, batch_date, list_type, source_kind, order, _now(),
+                        a.get("relevance_hint", ""),
                         body_status,
-                        1,
+                        int(publication_eligible),
                         publication_verification_basis,
                         publication_verified_at,
                     )
@@ -897,6 +926,7 @@ def search_articles(conn, q=None, date=None, list_type=None, publisher=None,
     selection_fields = (", s.batch_date AS selection_batch_date, "
                         "s.list_type AS selection_list_type, s.input_order AS selection_input_order, "
                         "s.source_kind AS selection_source_kind, "
+                        "s.relevance_hint AS selection_relevance_hint, "
                         "s.body_status AS selection_body_status, "
                         "s.publication_eligible AS selection_publication_eligible, "
                         "s.publication_verification_basis AS selection_publication_verification_basis, "
@@ -1054,7 +1084,7 @@ def build_digest_data(conn, batch_date: str) -> dict:
     인천 뉴스(hero_issues·all_by_type)와 타시도·일반교육 뉴스(other_issues·other_articles)를 분리한다.
     묶음은 구성 기사 중 한 건이라도 검증된 인천 입력이거나 제목 근거가 있으면 인천으로 분류.
     원시 후보는 DB에 보존한다. 공개 묶음·다이제스트는 브리핑 명시 기사와
-    `publication_eligible`가 명시된 후보만 사용한다.
+    `likely_relevant`·`needs_review` 후보를 사용하고 `likely_irrelevant`는 제외한다.
     TYPE_ORDER는 사용자가 정한 정무적 표시 순서를 그대로 유지한다.
     """
     rows = [
@@ -1181,11 +1211,55 @@ def digest_md(conn, batch_date: str) -> str:
     return "\n".join(lines).rstrip() + "\n"
 
 
+def _public_singleton_issue_fallback(data: dict) -> dict:
+    """공개본에서 명시 브리핑 단독 기사를 기존 핵심 카드 틀로 유지한다.
+
+    수집 후보의 공개 allow-list는 build_digest_data에서 적용한다.
+    다만 당일 브리핑에 명시된 인천 기사만 카드로 보여 주어, 수집량이 적거나
+    보도 중복이 없는 날에도 공개본의 주요 이슈 셸이 갑자기 사라지지 않게 한다.
+    """
+    if data.get("hero_issues"):
+        return data
+
+    fallback = []
+    remaining_by_type = []
+    for article_type, items in data.get("all_by_type", []):
+        remaining = []
+        for article in items:
+            if article.get("source_kind") in DIGEST_SOURCE_PRIORITY:
+                fallback.append({
+                    "group_id": None,
+                    "title": article["title"],
+                    "article_type": article.get("article_type") or article_type or "기타",
+                    "fields": [field for field in str(article.get("edu_fields", "")).split(",") if field],
+                    "member_count": 1,
+                    "summary": "",
+                    "representative": article,
+                    "others": [],
+                })
+            else:
+                remaining.append(article)
+        if remaining:
+            remaining_by_type.append((article_type, remaining))
+
+    if not fallback:
+        return data
+
+    public_data = dict(data)
+    public_data["hero_issues"] = fallback
+    public_data["all_by_type"] = remaining_by_type
+    public_data["meta"] = dict(data.get("meta", {}))
+    public_data["meta"]["issue_count"] = len(fallback)
+    return public_data
+
+
 def render_digest_html(data: dict, public: bool = False) -> str:
     """프리미엄 HTML 다이제스트 렌더. 인천교육청 CI 팔레트·로고 임베드. digest_html 모듈 위임.
 
     public=True: 공개(웹) 안전본 — 개인 데이터(내 관심업무·메모) 제외, 비공식 표기 추가.
     """
+    if public:
+        data = _public_singleton_issue_fallback(data)
     import digest_html
     return digest_html.render(data, load_logo_datauri(), public=public,
                               slogan_uri=load_asset("incheon_slogan.txt"),

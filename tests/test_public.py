@@ -188,12 +188,7 @@ class TestPublicationContract(unittest.TestCase):
         )
         self.assertEqual(
             contract["ingestion"]["publish_candidate_requires"],
-            [
-                "publication_eligible",
-                "body_status",
-                "publication_verification_basis",
-                "publication_verified_at",
-            ],
+            ["relevance_hint"],
         )
         self.assertEqual(
             contract["layout"]["sections_in_order"],
@@ -230,6 +225,14 @@ class TestPublicationContract(unittest.TestCase):
                     self._sparse_public_data(section), public=True
                 )
                 publish_site.validate_publication_contract(html, contract)
+
+    def test_public_briefing_singletons_keep_approved_issue_card_shell(self):
+        data = self._sparse_public_data("single")
+        data["all_by_type"][0][1][0]["source_kind"] = "briefing-md"
+        html = newsdb.render_digest_html(data, public=True)
+        self.assertIn("오늘의 핵심 이슈", html)
+        self.assertIn('class="hero-card"', html)
+        self.assertNotIn("전체 기사", html)
 
     def test_validator_blocks_missing_or_reordered_sections(self):
         contract = publish_site.load_publication_contract()
@@ -386,6 +389,14 @@ class TestGitPush(unittest.TestCase):
         run.return_value = mock.Mock(returncode=1, stdout="", stderr="authentication failed")
         with self.assertRaisesRegex(RuntimeError, "authentication failed"):
             publish_site.git_push(Path("site"), "2026-07-21")
+
+    @mock.patch("publish_site.subprocess.run")
+    def test_git_push_decodes_windows_git_output_as_utf8_safely(self, run):
+        run.return_value = mock.Mock(returncode=0, stdout="", stderr="")
+        publish_site.git_push(Path("site"), "2026-07-21")
+        for call in run.call_args_list:
+            self.assertEqual(call.kwargs["encoding"], "utf-8")
+            self.assertEqual(call.kwargs["errors"], "replace")
 
 
 if __name__ == "__main__":

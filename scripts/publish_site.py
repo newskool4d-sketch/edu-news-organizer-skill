@@ -68,7 +68,7 @@ def validate_ingestion_contract(conn, date_iso: str, contract: dict) -> None:
         )
     if contract["ingestion"].get("publish_candidate_requires") != newsdb.PUBLICATION_REQUIRED_FIELDS:
         raise ValueError(
-            "공개 입력 계약 위반: 후보 게시에는 본문 검증 메타데이터가 필요합니다."
+            "공개 입력 계약 위반: 후보 게시에는 관련성 판정 메타데이터가 필요합니다."
         )
     briefing = conn.execute(
         "SELECT MAX(batch_id) FROM source_batches WHERE batch_date = ? "
@@ -394,7 +394,14 @@ def git_push(site_dir: Path, date_iso: str):
     for args in (["git", "add", "-A"],
                  ["git", "commit", "-m", f"다이제스트 갱신: {date_label}"],
                  ["git", "push"]):
-        r = subprocess.run(args, cwd=str(site_dir), capture_output=True, text=True)
+        r = subprocess.run(
+            args,
+            cwd=str(site_dir),
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
         if r.returncode != 0 and "nothing to commit" not in (r.stdout + r.stderr):
             detail = r.stderr.strip() or r.stdout.strip() or f"exit code {r.returncode}"
             raise RuntimeError(f"[git] {' '.join(args)} 실패: {detail}")
