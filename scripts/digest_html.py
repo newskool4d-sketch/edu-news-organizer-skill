@@ -405,7 +405,7 @@ def render(data: dict, logo_uri: str = "", public: bool = False,
       <div class="mast-text">
         <p class="kicker">Incheon Education · Morning Press Brief {unofficial_tag}</p>
         <h1 class="mast-title">{title_html}</h1>
-        <p class="mast-date">{esc(date_disp)} 05:00 수집 기준</p>
+        <p class="mast-date">{esc(date_disp)} 09:00 수집 기준</p>
         {slogan_html}
       </div>
       <div class="stat-strip">{stats}</div>

@@ -79,7 +79,7 @@ class TestArchiveIndex(unittest.TestCase):
         self.assertIn('href="archive/2026-07-20.html"', html)
         self.assertIn("◀ 지난 호 (7. 20.)", html)
         self.assertIn("2026. 7. 21. (화)", html)
-        self.assertIn("다음 호 예정 · 매일 05:00", html)
+        self.assertIn("다음 호 예정 · 매일 09:00", html)
         self.assertIn('href="archive/index.html"', html)
         self.assertIn("전체 지난 호", html)
 

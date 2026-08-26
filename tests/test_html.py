@@ -68,7 +68,7 @@ class TestRenderHtml(unittest.TestCase):
         self.assertTrue(html.lstrip().startswith("<!doctype html>"))
         self.assertIn("인천교육청, 조식 지원 확대 발표", html)
         self.assertIn("2026-07-16", html)
-        self.assertIn("2026. 7. 16. (목) 05:00 수집 기준", html)
+        self.assertIn("2026. 7. 16. (목) 09:00 수집 기준", html)
         self.assertIn("<style>", html)
         self.assertIn("grid-template-columns:repeat(4,minmax(0,1fr))", html)
         self.assertIn("@media (max-width:720px)", html)

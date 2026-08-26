@@ -49,7 +49,7 @@ python ~/.codex/skills/edu-news-organizer/scripts/publish_site.py `
 - `EDU_NEWS_SITE_DIR` = `%USERPROFILE%\Documents\Codex\EduNewsSite` (site 폴더 = git 저장소 경로)
 - `EDU_NEWS_SITE_PUSH` = `1` (git push까지 자동. 생략하면 빌드만 하고 push는 수동)
 
-흐름: 평일 05:00 스케줄 → 브리핑·다이제스트 생성 → 공개본 site/ 갱신 → git push → Vercel 자동 재배포.
+흐름: 매일 09:00 스케줄(주말·공휴일은 러너가 스킵, 2026-08-21 05:00→09:00 변경) → 브리핑·다이제스트 생성 → 공개본 site/ 갱신 → git push → Vercel 자동 재배포.
 미설정 시 이 단계는 조용히 생략되어 기존 동작에 영향 없음.
 
 ## 안전 설계 메모
