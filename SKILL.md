@@ -1,6 +1,6 @@
 ---
 name: edu-news-organizer
-description: Ingest, organize, search, and annotate daily education news (Incheon + national) into a personal SQLite archive with interest tagging, read/favorite/memo actions, and md/csv export.
+description: "인천·전국 교육뉴스를 SQLite에 적재·정리·검색하고 관심 태그·읽음·보관·메모와 MD·CSV 출력을 제공한다. 신규 수집·선별은 daily-news-picker."
 metadata:
   short-description: 개인형 교육뉴스 정리·검색·보관 도구 (daily-news-picker 하류)
 ---
