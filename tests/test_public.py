@@ -188,7 +188,12 @@ class TestPublicationContract(unittest.TestCase):
         )
         self.assertEqual(
             contract["ingestion"]["publish_candidate_requires"],
-            ["relevance_hint"],
+            [
+                "publication_eligible",
+                "body_status",
+                "publication_verification_basis",
+                "publication_verified_at",
+            ],
         )
         self.assertEqual(
             contract["layout"]["sections_in_order"],

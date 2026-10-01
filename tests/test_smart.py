@@ -326,7 +326,7 @@ class TestSelectedFilter(unittest.TestCase):
         conn.close()
         tmp.cleanup()
 
-    def test_collector_publishes_aug20_relevance_allowlisted_candidates(self):
+    def test_collector_publishes_only_explicitly_verified_candidates(self):
         tmp = tempfile.TemporaryDirectory()
         conn = newsdb.open_db(str(Path(tmp.name) / "triage.db"))
         pool = [
@@ -349,7 +349,7 @@ class TestSelectedFilter(unittest.TestCase):
         rows = newsdb.search_articles(conn, date="2026-08-03", selected=True)
         self.assertEqual(
             {r["title"] for r in rows},
-            {"인천교육청 정책 점검", "경남교육청 수업 사례"},
+            {"인천교육청 정책 점검"},
         )
         self.assertEqual(len(newsdb.search_articles(conn, date="2026-08-03")), 5)
         conn.close()

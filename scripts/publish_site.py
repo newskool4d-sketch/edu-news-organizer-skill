@@ -68,7 +68,7 @@ def validate_ingestion_contract(conn, date_iso: str, contract: dict) -> None:
         )
     if contract["ingestion"].get("publish_candidate_requires") != newsdb.PUBLICATION_REQUIRED_FIELDS:
         raise ValueError(
-            "공개 입력 계약 위반: 후보 게시에는 관련성 판정 메타데이터가 필요합니다."
+            "공개 입력 계약 위반: 후보 게시에는 본문 검증 메타데이터가 필요합니다."
         )
     briefing = conn.execute(
         "SELECT MAX(batch_id) FROM source_batches WHERE batch_date = ? "

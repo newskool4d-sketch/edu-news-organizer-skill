@@ -14,12 +14,12 @@
       "collector-json"
     ],
     "preserve_all_candidates_in_database": true,
-    "publish_candidate_statuses": [
-      "likely_relevant",
-      "needs_review"
-    ],
+    "publish_candidate_statuses": [],
     "publish_candidate_requires": [
-      "relevance_hint"
+      "publication_eligible",
+      "body_status",
+      "publication_verification_basis",
+      "publication_verified_at"
     ],
     "always_publish_explicit_briefing_items": true,
     "exclude_candidate_statuses": [
@@ -27,7 +27,8 @@
     ],
     "release_required_checks": [
       "briefing-vs-published-content-parity"
-    ]
+    ],
+    "publish_candidate_rule": "collector-json 후보는 본문 검증 완료(publication_eligible=true + 근거 + 시각)인 경우에만 게시한다. relevance_hint는 triage 메타데이터일 뿐 게시 권한이 아니다."
   },
   "layout": {
     "template_file": "scripts/digest_html.py",
@@ -64,5 +65,12 @@
     "forbidden_text": [
       "내 관심업무"
     ]
-  }
+  },
+  "revisions": [
+    {
+      "date": "2026-10-02",
+      "approved_by": "user",
+      "change": "후보 게시 기준을 relevance_hint allow-list(2026-08-21 복원분)에서 본문 검증 통과분으로 되돌림. 레이아웃·섹션·순서 무변경."
+    }
+  ]
 }

@@ -35,10 +35,9 @@
 매핑: `batch_date` = window_end의 날짜부(보고일) / `list_type` = "인천교육" 고정 /
 `original_url` 없으면 `google_url` 폴백. 관련성 힌트와 근거 배열은 기사 테이블에 JSON 문자열로 보존한다.
 `engine: naver-api` 및 모든 `collector-json` 항목은 미선별 후보라는 점에 유의하며,
-`relevance_hint`는 공개 후보 allow-list에 사용한다. `likely_relevant`와 `needs_review`는
-공개 대상이고 `likely_irrelevant`는 공개에서 제외한다. `publication_eligible`, `body_status`,
-`publication_verification_basis`, `publication_verified_at`는 본문 검증·감사 메타데이터로
-계속 보존한다.
+`relevance_hint`는 수집·검토용 triage 값이며 공개 권한이 아니다. 후보는 `publication_eligible`이
+true이고 `body_status`가 "본문 검증 완료"이며 `publication_verification_basis`·`publication_verified_at`가
+채워진 경우에만 공개한다(2026-10-02 사용자 승인으로 복원). 그 외 후보는 검색·검토용으로만 보존한다.
 
 ## 2. 일일 브리핑 md (선별 완료본)
 
@@ -68,11 +67,11 @@ URL
 - 후보·선별 분리: 기존 게시 흐름대로 `briefing-md` 또는 본청 `paste`를 먼저 저장하고,
   `collector-json`을 이어서 저장해 후보 원본과 관련성 메타데이터를 보존한다. 본문 검증 표식으로
   승격된 파생 JSON이 있으면 원본 JSON 대신 그 파생본을 인제스트한다.
-  날짜별 `article_selections`에는 브리핑 명시 기사와 `relevance_hint`가
-  `likely_relevant`·`needs_review`인 후보를 기록한다. 검증 상태·근거·시각은 선택 관계에도
+  날짜별 `article_selections`에는 브리핑 명시 기사와 본문 검증이 완비된
+  (`publication_eligible`) 후보만 기록한다. 검증 상태·근거·시각은 선택 관계에도
   복사해 같은 `clean_url`이 다른 날짜에 재등장해도 날짜별 검증 이력을 독립적으로 보존한다.
 - 후보 보존: 모든 triage 상태 항목을 삭제하지 않고 내부 검색·검토용 DB에 보존한다.
-  공개 묶음·다이제스트에서는 브리핑 명시 기사와 `likely_relevant`·`needs_review` 후보를 게시한다.
+  공개 묶음·다이제스트에서는 브리핑 명시 기사와 본문 검증 완료 후보만 게시한다.
 - 관련성 메타데이터: `relevance_hint`와 근거 배열은 상류 선별을 돕는 정보다. organizer는 이를
   임의로 최종 판정하지 않고 상류 선별 결과를 명시적 상태로 소비한다.
 - 표시 순서: `교육감 → 정책·현안 → 인터뷰·기획 → 사업·성과 → 행사·모집 → 기타 → 비판·점검 → 타 시도 동향`을 유지한다.
@@ -80,8 +79,8 @@ URL
   현 단계에서 별개로 저장된다 (실측: 브리핑 38건 중 37건 중복 감지, 1건 URL 변형 통과) —
   2단계 동일보도 묶기에서 처리 예정.
 - 원본 보존: 입력 전문을 `source_batches.raw_text`에 그대로 저장.
-- 구 스키마 마이그레이션: 기존 `collector-json` 선택 관계는 `relevance_hint` allow-list에
-  따라 공개 선택 관계로 복원할 수 있으며, 과거 격리 기록은 `legacy_candidate_selections`에
-  사유·날짜·입력 순서를 보존한다.
+- 구 스키마 마이그레이션: 본문 검증 증거가 없는 기존 `collector-json` 선택 관계는 `open_db` 시
+  `legacy_candidate_selections`로 격리하며(사유·날짜·입력 순서 보존), 공개 선택 관계에서 제거한다.
+  2026-08-21~10-01 사이 allow-list로 복원됐던 관계도 같은 규칙으로 다시 격리된다.
 - DB: `%USERPROFILE%\Documents\Codex\EduNewsOrganizer\news.db`
   (환경변수 `EDU_NEWS_DB_PATH` 또는 `--db` 오버라이드). repo에는 커밋하지 않는다.

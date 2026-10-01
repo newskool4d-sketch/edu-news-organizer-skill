@@ -314,18 +314,26 @@ class TestParseCollectedJson(unittest.TestCase):
             conn.close()
 
 
-    def test_candidate_publication_uses_aug20_relevance_allowlist(self):
-        self.assertTrue(newsdb.is_publishable_for_digest({
+    def test_candidate_publication_requires_explicit_verification(self):
+        self.assertFalse(newsdb.is_publishable_for_digest({
             "source_kind": "collector-json",
             "relevance_hint": "likely_relevant",
             "publication_eligible": False,
         }))
-        self.assertTrue(newsdb.is_publishable_for_digest({
+        self.assertFalse(newsdb.is_publishable_for_digest({
             "source_kind": "collector-json",
             "relevance_hint": "needs_review",
             "publication_eligible": False,
         }))
         self.assertFalse(newsdb.is_publishable_for_digest({
+            "source_kind": "collector-json",
+            "relevance_hint": "likely_relevant",
+            "publication_eligible": True,
+            "body_status": "본문 미검증",
+            "publication_verification_basis": "",
+            "publication_verified_at": "",
+        }))
+        self.assertTrue(newsdb.is_publishable_for_digest({
             "source_kind": "collector-json",
             "relevance_hint": "likely_irrelevant",
             "publication_eligible": True,
@@ -371,7 +379,7 @@ class TestParseCollectedJson(unittest.TestCase):
             )
             conn.close()
 
-    def test_candidate_without_allowlisted_relevance_is_not_selected_or_published(self):
+    def test_unverified_true_candidate_is_not_selected_or_published(self):
         with tempfile.TemporaryDirectory() as tmp:
             conn = newsdb.open_db(str(Path(tmp) / "unverified.db"))
             newsdb.ingest_articles(
@@ -398,7 +406,7 @@ class TestParseCollectedJson(unittest.TestCase):
             )
             self.assertEqual(
                 conn.execute("SELECT publication_eligible FROM articles").fetchone()[0],
-                1,
+                0,
             )
             conn.close()
 
