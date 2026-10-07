@@ -7,6 +7,7 @@
 - 입력(제목·매체)은 외부 뉴스라 신뢰 불가 → 전부 HTML 이스케이프, http(s) URL만 링크화
 """
 import html as _html
+import re
 from datetime import datetime
 
 # 성격 → 강조색 (CI 팔레트 파생)
@@ -43,6 +44,52 @@ def _fmt_date(batch_date: str) -> str:
         return batch_date
 
 
+# ---- 표시용 제목 정리 (2026-10-07 사용자 승인) ----
+# 수집기 제목에는 매체 사이트가 붙인 꼬리말이 남는다: " > 뉴스 | 더코리아", " - 머니투데이",
+# "…촉구:경찰연합신문", "…:동아경제신문 & daenews.co.kr". DB 원문은 보존하고 화면에서만 뗀다.
+# 제목 중간의 하이픈·콜론("인천시교육청-남동구, …", "'이산가족의 날' - 실향민 …")은 건드리지 않도록
+# 꼬리 조각이 매체명과 일치·포함되거나, '뉴스'이거나, 매체명 어미·도메인 꼴일 때만 뗀다.
+_TAIL_RE = re.compile(r"(?:\s+[-–—|｜>]\s*|\s*[:：|｜>]\s*)([^-–—|｜>:：]{1,40})$")
+_OUTLET_SUFFIX_RE = re.compile(
+    r"(일보|신문|뉴스|news|투데이|타임스|타임즈|타임|미디어|방송|TV|닷컴|포커스|저널|데일리|매일|신보|위크|매거진|"
+    r"통신|헤럴드|포스트|경제|코리아|프레스|press|리뷰|저널리즘|뉴시스|연합)$",
+    re.IGNORECASE,
+)
+_DOMAIN_RE = re.compile(r"[A-Za-z0-9-]+\.(?:co\.kr|com|kr|net|org|io)\b", re.IGNORECASE)
+
+
+def _is_outlet_tail(segment: str, publisher: str) -> bool:
+    seg = (segment or "").strip(" .·")
+    if not seg:
+        return False
+    if seg.lower() in {"뉴스", "news"}:
+        return True
+    pub = (publisher or "").strip()
+    if pub and (seg == pub or seg in pub or pub in seg):
+        return True
+    if _DOMAIN_RE.search(seg):
+        return True
+    return bool(_OUTLET_SUFFIX_RE.search(seg))
+
+
+def _pub(row) -> str:
+    try:
+        return row["publisher"] or ""
+    except (KeyError, IndexError, TypeError):
+        return ""
+
+
+def display_title(title: str, publisher: str = "") -> str:
+    """화면 표시용 제목: 끝에 붙은 매체 꼬리말을 최대 3회 뗀다. 원문(DB)은 바꾸지 않는다."""
+    t = (title or "").strip()
+    for _ in range(3):
+        m = _TAIL_RE.search(t)
+        if not m or not _is_outlet_tail(m.group(1), publisher):
+            break
+        t = t[:m.start()].rstrip()
+    return t or (title or "")
+
+
 def _chip(text: str, cls: str = "") -> str:
     return f'<span class="chip {cls}">{esc(text)}</span>'
 
@@ -73,14 +120,14 @@ def _hero_card(g: dict) -> str:
         if extra > 0:
             chips += f'<span class="src-chip src-more">+{extra}</span>'
         others = f'<div class="related"><span class="related-label">관련 매체</span>{chips}</div>'
-    rep_link = _link(rep["original_url"], rep["title"])
+    rep_link = _link(rep["original_url"], display_title(rep["title"], _pub(rep)))
     return f'''
       <article class="hero-card" style="--accent:{color}">
         <header class="hero-head">
           <span class="type-badge" style="background:{color}">{esc(g["article_type"])}</span>
           <div class="field-chips">{fields}</div>
         </header>
-        <h3 class="hero-title">{esc(g["title"])}</h3>
+        <h3 class="hero-title">{esc(display_title(g["title"], _pub(rep)))}</h3>
         {summary}
         <div class="hero-count">
           <span class="count-pill" style="--accent:{color}">관련 보도 {esc(g["member_count"])}건</span>
@@ -102,7 +149,7 @@ def _interest_item(r: dict) -> str:
       <li class="int-item">
         <div class="int-tags">{tags}{fav}</div>
         <div class="int-body">
-          <span class="int-title">{_link(r["original_url"], r["title"])}</span>
+          <span class="int-title">{_link(r["original_url"], display_title(r["title"], _pub(r)))}</span>
           <span class="int-pub">{esc(r["publisher"])}</span>
         </div>
         {memo}
@@ -110,7 +157,7 @@ def _interest_item(r: dict) -> str:
 
 
 def _all_row(r: dict) -> str:
-    return (f'<li class="row"><span class="row-title">{_link(r["original_url"], r["title"])}</span>'
+    return (f'<li class="row"><span class="row-title">{_link(r["original_url"], display_title(r["title"], _pub(r)))}</span>'
             f'<span class="row-pub">{esc(r["publisher"])}</span></li>')
 
 
@@ -172,7 +219,7 @@ def render(data: dict, logo_uri: str = "", public: bool = False,
         for g in other_issues:
             rep = g["representative"]
             rows.append(
-                f'<li class="row"><span class="row-title">{_link(rep["original_url"], g["title"])}'
+                f'<li class="row"><span class="row-title">{_link(rep["original_url"], display_title(g["title"], _pub(rep)))}'
                 f'<span class="row-count">관련 {esc(g["member_count"])}건</span></span>'
                 f'<span class="row-pub">{esc(rep["publisher"])}</span></li>')
         for r in other_articles:

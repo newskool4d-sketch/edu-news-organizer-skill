@@ -67,7 +67,8 @@
       "@media (max-width:720px)"
     ],
     "public_hero_singleton_limit": 10,
-    "public_hero_order": "교육감 유형 최우선(선정·정렬 모두), 그다음 동일 사안 묶음, 나머지 브리핑 단독 기사는 보고서 입력 순서"
+    "public_hero_order": "교육감 유형 최우선(선정·정렬 모두), 그다음 동일 사안 묶음, 나머지 브리핑 단독 기사는 보고서 입력 순서",
+    "display_title_cleanup": "표시 제목에서 매체 꼬리말(' - 매체', ' | 매체', ' > 뉴스', ':매체', 도메인)만 제거(digest_html.display_title). DB 원문·URL 무변경."
   },
   "article_type_order": [
     "교육감",
@@ -105,6 +106,11 @@
       "date": "2026-10-07",
       "approved_by": "user",
       "change": "하단 '타 시도·일반 교육 동향' 참고 목록 복원. 10-01 이전처럼 비인천 후보 전부가 아니라 교육 주제가 확인되는 비인천 후보만, 동일 사안 묶음·30건 상한. 공개 본문 기준(본문 검증 통과분)은 무변경."
+    },
+    {
+      "date": "2026-10-07",
+      "approved_by": "user",
+      "change": "템플릿: 표시 제목의 매체 꼬리말 제거(display_title). 레이아웃·섹션·순서 무변경."
     }
   ]
 }
