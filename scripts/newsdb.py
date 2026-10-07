@@ -1046,6 +1046,141 @@ def is_incheon_article(article: dict) -> bool:
     return not stripped.startswith("교육부") and not any(region in title for region in OTHER_REGIONS)
 
 
+
+
+# ---- 하단 참고 목록: 타 시도·일반 교육 동향 (2026-10-07 사용자 승인) ----
+# 공개 본문(핵심 카드·전체 기사)은 본문 검증 통과분만 싣는다. 하단 "타 시도·일반 교육 동향"은
+# 참고용으로, 당일 수집 후보 중 인천 기사가 아니고 제목에 교육 주체가 확인되는 것만 싣는다.
+# 10-01 이전처럼 비인천 후보 전부(금융·식품·지역 행사)를 싣지 않는다.
+GENERAL_EDU_MARKERS = (
+    "교육부", "교육청", "교육감", "교육지원청", "교육장", "학교", "학생", "교사", "교원", "교장",
+    "교육과정", "수능", "입시", "유치원", "특수교육", "고교학점제", "늘봄", "돌봄", "학부모", "Wee",
+)
+# 인천 소속기관을 '인천' 접두어 없이 쓴 제목은 인천 기사다. 검증되지 않았으므로 어느 섹션에도 싣지 않는다.
+REFERENCE_EXCLUDE_MARKERS = (
+    "남부교육지원청", "북부교육지원청", "동부교육지원청", "서부교육지원청", "강화교육지원청",
+    "학생교육원", "교직원수련원", "난정평화교육원", "동아시아국제교육원", "학생교육문화회관",
+    "신트리도서관", "화도진도서관", "주안도서관", "계양도서관", "연수도서관",
+)
+# 제목에 '인천'이 없어도 인천 기사인 지명 힌트. 일반 명사와 겹치는 지명(가정·계산·논현 등)은 넣지 않는다.
+REFERENCE_INCHEON_PLACE_HINTS = (
+    "백령도", "연평도", "대청도", "덕적도", "영흥도", "장봉도", "시도·모도", "인현동",
+    "구월동", "주안", "부개", "검암", "석남", "운서", "가좌", "만수동",
+)
+REFERENCE_SECTION_LIMIT = 30
+# 참고 목록 동일 사안 묶음: 제목 유사도 0.60 기준(본문용)보다 느슨하게, 글자열 0.50 또는 2-gram Jaccard 0.30.
+# 매체마다 제목을 바꿔 쓰는 타 시도 보도자료 전재가 많아, 참고 목록에서는 과소 묶음보다 과다 묶음이 낫다.
+REFERENCE_SM_THRESHOLD = 0.50
+REFERENCE_JACCARD_THRESHOLD = 0.30
+_POLICY_MARKERS = ("교육부", "교육청", "교육감")
+
+
+def is_general_education_reference(article: dict) -> bool:
+    """하단 참고 목록 후보 판정: 비인천 + 교육 주체 제목 + 상업 잡음 없음."""
+    title = (article.get("title") or "").strip()
+    if not title or is_incheon_title(title):
+        return False
+    if any(marker in title for marker in REFERENCE_EXCLUDE_MARKERS):
+        return False
+    if any(hint in title for hint in REFERENCE_INCHEON_PLACE_HINTS):
+        return False
+    negative = article.get("negative_context_hits") or ""
+    if isinstance(negative, str):
+        try:
+            negative = json.loads(negative) if negative else []
+        except ValueError:
+            negative = [negative]
+    if negative:
+        return False
+    if (article.get("article_type") or classify_type(title)) == "타 시도 동향":
+        return True
+    return any(marker in title for marker in GENERAL_EDU_MARKERS)
+
+
+def _reference_title_key(title: str) -> str:
+    """참고 목록 묶음용 제목 키: 꼬리 매체명(' - 매체', ' > 뉴스', ' | 매체')과 머리 [코너명]을 떼고 정규화."""
+    t = title or ""
+    for _ in range(3):  # ' > 뉴스 | 매체' 처럼 꼬리가 겹쳐 붙은 경우까지 제거
+        stripped = re.sub(r"\s*[-|>]\s*[^-|>]{1,20}$", "", t)
+        if stripped == t:
+            break
+        t = stripped
+    t = re.sub(r"^\s*\[[^\]]*\]\s*", "", t)
+    return normalize_title(t)
+
+
+def _reference_rank(title: str, article_type: str) -> int:
+    """정책성(타 시도교육청·교육부·교육감) 기사를 행사·일반 기사보다 앞에 둔다."""
+    if article_type == "타 시도 동향" or any(m in (title or "") for m in _POLICY_MARKERS):
+        return 0
+    return 1
+
+
+def build_reference_candidates(conn, batch_date: str, exclude_urls: set = None) -> tuple:
+    """당일 미선별 후보에서 참고 목록(묶음, 단독)을 만든다. 공개 본문 기사와는 섞이지 않는다."""
+    import difflib
+    rows = conn.execute(
+        "SELECT a.* FROM articles a WHERE a.batch_date = ? AND NOT EXISTS "
+        "(SELECT 1 FROM article_selections s WHERE s.article_id = a.article_id AND s.batch_date = a.batch_date) "
+        "ORDER BY a.input_order, a.article_id",
+        (batch_date,)).fetchall()
+    exclude_urls = exclude_urls or set()
+    cands = [dict(r) for r in rows]
+    cands = [c for c in cands
+             if is_general_education_reference(c) and c.get("clean_url") not in exclude_urls]
+    if not cands:
+        return [], []
+
+    norm = [_reference_title_key(c["title"]) for c in cands]
+    grams = [{n[k:k + 2] for k in range(len(n) - 1)} for n in norm]
+    parent = list(range(len(cands)))
+
+    def find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    for i in range(len(cands)):
+        for j in range(i + 1, len(cands)):
+            sm = difflib.SequenceMatcher(None, norm[i], norm[j]).ratio()
+            union = grams[i] | grams[j]
+            jac = (len(grams[i] & grams[j]) / len(union)) if union else 0.0
+            if sm >= REFERENCE_SM_THRESHOLD or jac >= REFERENCE_JACCARD_THRESHOLD:
+                parent[find(i)] = find(j)
+
+    clusters = {}
+    for i, c in enumerate(cands):
+        clusters.setdefault(find(i), []).append(c)
+
+    issues, singles = [], []
+    for members in clusters.values():
+        members.sort(key=lambda c: (c.get("published_at") or "9999", c.get("input_order") or 0))
+        rep = members[0]
+        if len(members) >= 2:
+            issues.append({
+                "group_id": None,
+                "title": rep["title"],
+                "article_type": rep.get("article_type") or "기타",
+                "fields": [f for f in str(rep.get("edu_fields") or "").split(",") if f],
+                "member_count": len(members),
+                "summary": "",
+                "representative": rep,
+                "others": members[1:],
+            })
+        else:
+            singles.append(rep)
+
+    issues.sort(key=lambda g: (_reference_rank(g["title"], g["article_type"]),
+                               -g["member_count"], g["representative"].get("input_order") or 0))
+    singles.sort(key=lambda r: (_reference_rank(r["title"], r.get("article_type") or ""),
+                                r.get("input_order") or 0))
+    budget = REFERENCE_SECTION_LIMIT
+    kept_issues = issues[:budget]
+    budget -= len(kept_issues)
+    kept_singles = singles[:max(budget, 0)]
+    return kept_issues, kept_singles
+
 def build_digest_data(conn, batch_date: str) -> dict:
     """다이제스트 공유 데이터 구조. md·html 렌더러가 모두 이 데이터를 소비한다.
 
@@ -1054,6 +1189,7 @@ def build_digest_data(conn, batch_date: str) -> dict:
     원시 후보는 DB에 보존한다. 공개 묶음·다이제스트는 브리핑 명시 기사와
     본문 검증이 명시된(`publication_eligible`) 후보만 사용한다.
     TYPE_ORDER는 사용자가 정한 정무적 표시 순서를 그대로 유지한다.
+    하단 "타 시도·일반 교육 동향"은 build_reference_candidates()의 참고 목록(미검증 후보)을 더한다.
     """
     rows = [
         row for row in search_articles(conn, date=batch_date, selected=True, limit=2000)
@@ -1106,6 +1242,12 @@ def build_digest_data(conn, batch_date: str) -> dict:
     for r in incheon_singles:
         by_type.setdefault(r["article_type"] or "기타", []).append(r)
     all_by_type = [(t, by_type[t]) for t in TYPE_ORDER if t in by_type]
+
+    # 하단 참고 목록(타 시도·일반 교육 동향): 미검증 후보 중 비인천·교육 주제만, 공개 본문과 URL 중복 제외
+    shown_urls = {r["clean_url"] for r in rows if r["clean_url"]}
+    ref_issues, ref_articles = build_reference_candidates(conn, batch_date, shown_urls)
+    other_issues.extend(ref_issues)
+    other_articles.extend(ref_articles)
 
     publishers = {r["publisher"] for r in rows if r["publisher"]}
     return {

@@ -28,7 +28,24 @@
     "release_required_checks": [
       "briefing-vs-published-content-parity"
     ],
-    "publish_candidate_rule": "collector-json 후보는 본문 검증 완료(publication_eligible=true + 근거 + 시각)인 경우에만 게시한다. relevance_hint는 triage 메타데이터일 뿐 게시 권한이 아니다."
+    "publish_candidate_rule": "collector-json 후보는 본문 검증 완료(publication_eligible=true + 근거 + 시각)인 경우에만 게시한다. relevance_hint는 triage 메타데이터일 뿐 게시 권한이 아니다.",
+    "reference_section": {
+      "section": "타 시도·일반 교육 동향",
+      "source": "당일 수집 후보 중 article_selections에 없는 미검증 기사",
+      "include_when": [
+        "제목에 인천 마커(INCHEON_MARKERS) 없음",
+        "제목에 인천 소속기관 명칭(REFERENCE_EXCLUDE_MARKERS) 없음",
+        "negative_context_hits 비어 있음",
+        "article_type == '타 시도 동향' 또는 제목에 GENERAL_EDU_MARKERS 중 하나"
+      ],
+      "same_story_grouping": "정규화 제목 SequenceMatcher >= GROUP_THRESHOLD, 대표 = 최초 보도",
+      "order": "정책성(타 시도교육청·교육부·교육감) → 묶음 크기 → 입력 순서",
+      "limit": 30,
+      "never_in": [
+        "오늘의 핵심 이슈",
+        "전체 기사"
+      ]
+    }
   },
   "layout": {
     "template_file": "scripts/digest_html.py",
@@ -83,6 +100,11 @@
       "date": "2026-10-07",
       "approved_by": "user",
       "change": "핵심 카드 상한 적용 시 교육감 기사 최우선 지침(article_type_order 첫 자리)을 선정·정렬에 복원. 10-07 1차 재게시본에서 교육감 기사가 2번째로 밀린 회귀 교정."
+    },
+    {
+      "date": "2026-10-07",
+      "approved_by": "user",
+      "change": "하단 '타 시도·일반 교육 동향' 참고 목록 복원. 10-01 이전처럼 비인천 후보 전부가 아니라 교육 주제가 확인되는 비인천 후보만, 동일 사안 묶음·30건 상한. 공개 본문 기준(본문 검증 통과분)은 무변경."
     }
   ]
 }

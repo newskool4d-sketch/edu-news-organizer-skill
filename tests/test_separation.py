@@ -98,7 +98,7 @@ class TestDigestSourcePreservation(unittest.TestCase):
         self.conn.close()
         self.tmp.cleanup()
 
-    def test_raw_collector_pool_is_preserved_but_not_published(self):
+    def test_raw_collector_pool_is_preserved_and_only_reference_section_shows_it(self):
         raw = [
             {"title": "쿠팡, 인천 물류센터 화재 판매자 재고 보상",
              "publisher": "상업매체", "original_url": "https://a.kr/raw1",
@@ -118,7 +118,9 @@ class TestDigestSourcePreservation(unittest.TestCase):
         self.assertEqual(data["meta"]["total"], 0)
         self.assertEqual(data["meta"]["candidate_total"], 2)
         self.assertEqual(incheon_titles, [])
-        self.assertEqual(other_titles, [])
+        # 미검증 후보는 공개 본문에 오르지 않는다. 하단 참고 목록에는 비인천·교육 주제 후보만 실린다
+        # (쿠팡 건은 인천 마커·상업 잡음으로 제외, 공모전 건은 '학생'으로 포함).
+        self.assertEqual(other_titles, ["전국 학생 대상 공모전 개최"])
         self.assertEqual(
             len(newsdb.search_articles(self.conn, date="2026-07-24")), 2
         )
