@@ -1191,6 +1191,10 @@ def _public_singleton_issue_fallback(data: dict) -> dict:
     동일 사안 묶음이 거의 생기지 않는다. 이전 폴백은 묶음이 없으면 브리핑 기사 전부를
     카드로 올려 유형별 "전체 기사" 목록이 사라졌다. 이제는 묶음 카드 + 브리핑 단독 기사를
     합쳐 PUBLIC_HERO_SINGLETON_LIMIT건까지만 카드로 두고, 나머지는 유형별 목록에 남긴다.
+
+    교육감 기사 최우선(사용자 상위 지침, TYPE_ORDER 첫 자리): 교육감 유형 단독 기사는 보고서
+    위치와 무관하게 먼저 카드 자리를 받고, 카드 정렬에서도 맨 앞에 놓는다. 그 외 단독 기사는
+    보고서(입력) 순서를 유지한다.
     """
     hero = list(data.get("hero_issues") or [])
     slots = PUBLIC_HERO_SINGLETON_LIMIT - len(hero)
@@ -1204,14 +1208,17 @@ def _public_singleton_issue_fallback(data: dict) -> dict:
     def _key(article):
         return article.get("article_id") or article.get("clean_url") or article.get("original_url")
 
+    def _type_of(article, fallback_type):
+        return article.get("article_type") or fallback_type or "기타"
+
     candidates = []
     for article_type, items in data.get("all_by_type", []):
         for article in items:
             if article.get("source_kind") in DIGEST_SOURCE_PRIORITY:
-                candidates.append((_order(article), article_type, article))
+                candidates.append((_order(article), _type_of(article, article_type), article))
     if not candidates:
         return data
-    candidates.sort(key=lambda c: c[0])
+    candidates.sort(key=lambda c: (0 if c[1] == TYPE_ORDER[0] else 1, c[0]))
 
     promoted = set()
     for _order_value, article_type, article in candidates[:slots]:
@@ -1219,7 +1226,7 @@ def _public_singleton_issue_fallback(data: dict) -> dict:
         hero.append({
             "group_id": None,
             "title": article["title"],
-            "article_type": article.get("article_type") or article_type or "기타",
+            "article_type": article_type,
             "fields": [field for field in str(article.get("edu_fields", "")).split(",") if field],
             "member_count": 1,
             "summary": "",
@@ -1232,6 +1239,17 @@ def _public_singleton_issue_fallback(data: dict) -> dict:
         remaining = [a for a in items if _key(a) not in promoted]
         if remaining:
             remaining_by_type.append((article_type, remaining))
+
+    hero = [
+        g for _, g in sorted(
+            enumerate(hero),
+            key=lambda pair: (
+                0 if pair[1].get("article_type") == TYPE_ORDER[0] else 1,
+                0 if pair[1].get("member_count", 1) > 1 else 1,
+                pair[0],
+            ),
+        )
+    ]
 
     public_data = dict(data)
     public_data["hero_issues"] = hero

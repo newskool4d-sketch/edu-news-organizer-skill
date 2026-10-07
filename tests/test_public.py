@@ -267,6 +267,40 @@ class TestPublicationContract(unittest.TestCase):
         self.assertEqual(html.count('class="hero-card"'), 10)
         self.assertIn("전체 기사", html)
 
+    def test_public_superintendent_single_is_selected_and_placed_first(self):
+        data = self._sparse_public_data("empty")
+        items = []
+        for i in range(12):
+            items.append({
+                "article_id": 200 + i,
+                "title": f"일반 기사 {i:02d}",
+                "publisher": "예시매체",
+                "original_url": f"https://example.com/n{i}",
+                "source_kind": "briefing-md",
+                "article_type": "행사·모집",
+                "selection_input_order": i + 1,
+            })
+        superintendent = {
+            "article_id": 300,
+            "title": "도성훈 인천시교육감, 주민배심원 위촉",
+            "publisher": "예시매체",
+            "original_url": "https://example.com/super",
+            "source_kind": "briefing-md",
+            "article_type": "교육감",
+            "selection_input_order": 13,   # 보고서 맨 끝에 있어도
+        }
+        data["all_by_type"] = [("교육감", [superintendent]), ("행사·모집", items)]
+        data["meta"]["total"] = 13
+        public = newsdb._public_singleton_issue_fallback(data)
+        self.assertEqual(len(public["hero_issues"]), 10)
+        self.assertEqual(public["hero_issues"][0]["article_type"], "교육감")
+        self.assertEqual(
+            [g["representative"]["selection_input_order"] for g in public["hero_issues"]],
+            [13, 1, 2, 3, 4, 5, 6, 7, 8, 9],
+        )
+        remaining = [a["selection_input_order"] for _, rows in public["all_by_type"] for a in rows]
+        self.assertEqual(remaining, [10, 11, 12])
+
     def test_public_real_groups_take_hero_slots_first(self):
         data = self._sparse_public_data("hero")
         single = {
