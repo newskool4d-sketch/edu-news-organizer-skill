@@ -239,6 +239,46 @@ class TestPublicationContract(unittest.TestCase):
         self.assertIn('class="hero-card"', html)
         self.assertNotIn("전체 기사", html)
 
+    def test_public_briefing_singletons_cap_hero_cards_and_keep_type_sections(self):
+        data = self._sparse_public_data("empty")
+        items = []
+        for i in range(13):
+            items.append({
+                "article_id": 100 + i,
+                "title": f"브리핑 기사 {i:02d}",
+                "publisher": "예시매체",
+                "original_url": f"https://example.com/b{i}",
+                "source_kind": "briefing-md",
+                "article_type": "행사·모집",
+                # 입력 순서를 거꾸로 주어 정렬이 제목·목록 순서가 아니라 입력 순서를 따르는지 확인
+                "selection_input_order": 13 - i,
+            })
+        data["all_by_type"] = [("행사·모집", items)]
+        data["meta"]["total"] = 13
+        public = newsdb._public_singleton_issue_fallback(data)
+        self.assertEqual(len(public["hero_issues"]), newsdb.PUBLIC_HERO_SINGLETON_LIMIT)
+        self.assertEqual(
+            [g["representative"]["selection_input_order"] for g in public["hero_issues"]],
+            list(range(1, 11)),
+        )
+        remaining = [a["selection_input_order"] for _, rows in public["all_by_type"] for a in rows]
+        self.assertEqual(remaining, [13, 12, 11])
+        html = newsdb.render_digest_html(data, public=True)
+        self.assertEqual(html.count('class="hero-card"'), 10)
+        self.assertIn("전체 기사", html)
+
+    def test_public_real_groups_take_hero_slots_first(self):
+        data = self._sparse_public_data("hero")
+        single = {
+            "article_id": 7, "title": "브리핑 단독", "publisher": "예시매체",
+            "original_url": "https://example.com/single", "source_kind": "briefing-md",
+            "article_type": "기타", "selection_input_order": 1,
+        }
+        data["all_by_type"] = [("기타", [single])]
+        public = newsdb._public_singleton_issue_fallback(data)
+        self.assertEqual([g["member_count"] for g in public["hero_issues"]], [2, 1])
+        self.assertEqual(public["all_by_type"], [])
+
     def test_validator_blocks_missing_or_reordered_sections(self):
         contract = publish_site.load_publication_contract()
         css = "\n".join(contract["layout"]["required_css_tokens"])

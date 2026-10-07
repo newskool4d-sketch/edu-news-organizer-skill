@@ -1179,45 +1179,65 @@ def digest_md(conn, batch_date: str) -> str:
     return "\n".join(lines).rstrip() + "\n"
 
 
-def _public_singleton_issue_fallback(data: dict) -> dict:
-    """공개본에서 명시 브리핑 단독 기사를 기존 핵심 카드 틀로 유지한다.
+# 공개본 핵심 카드 상한. 동일 사안 묶음이 먼저 자리를 차지하고, 남는 자리만
+# 브리핑 단독 기사(입력 순서 = 상류 중요도 순)로 채운다. (2026-10-07 사용자 승인, N=10)
+PUBLIC_HERO_SINGLETON_LIMIT = 10
 
-    수집 후보의 공개 allow-list는 build_digest_data에서 적용한다.
-    다만 당일 브리핑에 명시된 인천 기사만 카드로 보여 주어, 수집량이 적거나
-    보도 중복이 없는 날에도 공개본의 주요 이슈 셸이 갑자기 사라지지 않게 한다.
+
+def _public_singleton_issue_fallback(data: dict) -> dict:
+    """공개본에서 명시 브리핑 단독 기사 일부를 핵심 카드로 올린다.
+
+    2026-10-02부터 공개본은 본문 검증 통과 기사만 싣고 상류가 사안당 대표 1건만 남기므로
+    동일 사안 묶음이 거의 생기지 않는다. 이전 폴백은 묶음이 없으면 브리핑 기사 전부를
+    카드로 올려 유형별 "전체 기사" 목록이 사라졌다. 이제는 묶음 카드 + 브리핑 단독 기사를
+    합쳐 PUBLIC_HERO_SINGLETON_LIMIT건까지만 카드로 두고, 나머지는 유형별 목록에 남긴다.
     """
-    if data.get("hero_issues"):
+    hero = list(data.get("hero_issues") or [])
+    slots = PUBLIC_HERO_SINGLETON_LIMIT - len(hero)
+    if slots <= 0:
         return data
 
-    fallback = []
-    remaining_by_type = []
+    def _order(article):
+        value = article.get("selection_input_order", article.get("input_order"))
+        return value if isinstance(value, int) else 10 ** 9
+
+    def _key(article):
+        return article.get("article_id") or article.get("clean_url") or article.get("original_url")
+
+    candidates = []
     for article_type, items in data.get("all_by_type", []):
-        remaining = []
         for article in items:
             if article.get("source_kind") in DIGEST_SOURCE_PRIORITY:
-                fallback.append({
-                    "group_id": None,
-                    "title": article["title"],
-                    "article_type": article.get("article_type") or article_type or "기타",
-                    "fields": [field for field in str(article.get("edu_fields", "")).split(",") if field],
-                    "member_count": 1,
-                    "summary": "",
-                    "representative": article,
-                    "others": [],
-                })
-            else:
-                remaining.append(article)
+                candidates.append((_order(article), article_type, article))
+    if not candidates:
+        return data
+    candidates.sort(key=lambda c: c[0])
+
+    promoted = set()
+    for _order_value, article_type, article in candidates[:slots]:
+        promoted.add(_key(article))
+        hero.append({
+            "group_id": None,
+            "title": article["title"],
+            "article_type": article.get("article_type") or article_type or "기타",
+            "fields": [field for field in str(article.get("edu_fields", "")).split(",") if field],
+            "member_count": 1,
+            "summary": "",
+            "representative": article,
+            "others": [],
+        })
+
+    remaining_by_type = []
+    for article_type, items in data.get("all_by_type", []):
+        remaining = [a for a in items if _key(a) not in promoted]
         if remaining:
             remaining_by_type.append((article_type, remaining))
 
-    if not fallback:
-        return data
-
     public_data = dict(data)
-    public_data["hero_issues"] = fallback
+    public_data["hero_issues"] = hero
     public_data["all_by_type"] = remaining_by_type
     public_data["meta"] = dict(data.get("meta", {}))
-    public_data["meta"]["issue_count"] = len(fallback)
+    public_data["meta"]["issue_count"] = len(hero)
     return public_data
 
 

@@ -48,7 +48,8 @@
       "grid-template-columns:repeat(4,minmax(0,1fr))",
       "@media (max-width:1100px)",
       "@media (max-width:720px)"
-    ]
+    ],
+    "public_hero_singleton_limit": 10
   },
   "article_type_order": [
     "교육감",
@@ -71,6 +72,11 @@
       "date": "2026-10-02",
       "approved_by": "user",
       "change": "후보 게시 기준을 relevance_hint allow-list(2026-08-21 복원분)에서 본문 검증 통과분으로 되돌림. 레이아웃·섹션·순서 무변경."
+    },
+    {
+      "date": "2026-10-07",
+      "approved_by": "user",
+      "change": "공개본 핵심 카드: 묶음 + 브리핑 단독 기사 합계 10건 상한(입력 순서 우선), 나머지는 전체 기사 유형별 목록. 10-02 이후 묶음 0건으로 전 기사가 카드화되던 폴백 교정. 섹션 순서·템플릿 무변경."
     }
   ]
 }
