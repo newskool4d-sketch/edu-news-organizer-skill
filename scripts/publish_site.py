@@ -15,14 +15,20 @@ site/
   python publish_site.py --rebuild-index --site-dir <경로>            # 아카이브 인덱스만 재생성
 """
 import argparse
+import hashlib
 import html as _html
 import json
+import os
 import re
+import shutil
 import sqlite3
 import subprocess
 import sys
+import tempfile
 from datetime import datetime
+from html.parser import HTMLParser
 from pathlib import Path
+from urllib.parse import urlsplit, urlunsplit
 
 sys.path.insert(0, str(Path(__file__).parent))
 import newsdb  # noqa: E402
@@ -32,6 +38,8 @@ if sys.stdout is not None and hasattr(sys.stdout, "reconfigure"):
 
 DATE_RE = re.compile(r"^(20\d{2}-\d{2}-\d{2})\.html$")
 CONTRACT_PATH = Path(__file__).resolve().parents[1] / "references" / "publication-contract.json"
+MANIFEST_NAME = "publication-manifest.json"
+MANIFEST_GENERATOR = "edu-news-organizer/publish_site"
 NAV_STYLE_RE = re.compile(
     r"\s*/\* EDU_NEWS_SITE_NAV_START \*/.*?/\* EDU_NEWS_SITE_NAV_END \*/\s*",
     re.DOTALL,
@@ -114,8 +122,8 @@ def validate_grouping_state(conn, date_iso: str) -> None:
         )
 
 
-def validate_publication_contract(html: str, contract: dict) -> None:
-    """레이아웃·유형 순서·공개 안전 규칙이 승인 JSON과 같지 않으면 실패한다."""
+def validate_publication_contract(html: str, contract: dict, *, allow_legacy: bool = False) -> None:
+    """현재 공개 계약을 검사한다. 명시 이관된 구형 파일은 과거 열 CSS를 보존한다."""
     main_pos = html.find("<main")
     if main_pos < 0:
         raise ValueError("공개 구조 위반: <main>이 없습니다.")
@@ -130,9 +138,12 @@ def validate_publication_contract(html: str, contract: dict) -> None:
             positions.append(pos)
     if positions != sorted(positions):
         raise ValueError("공개 구조 위반: 표시된 섹션 순서가 변경됐습니다.")
-    for token in layout["required_css_tokens"]:
-        if token not in html:
-            raise ValueError(f"공개 구조 위반: 반응형 CSS 토큰 누락 - {token}")
+    # 구형 공개본의 열 구조는 당시 산출물을 보존한다. 이 예외는 명시 이관 검사 또는
+    # 그 결과의 파일별 source+hash를 확인한 build 경로에서만 사용한다.
+    if not allow_legacy:
+        for token in layout["required_css_tokens"]:
+            if token not in html:
+                raise ValueError(f"공개 구조 위반: 반응형 CSS 토큰 누락 - {token}")
     if newsdb.TYPE_ORDER != contract["article_type_order"]:
         raise ValueError("공개 구조 위반: 기사 유형 순서가 승인 계약과 다릅니다.")
     marker = contract["public_safety"]["required_marker"]
@@ -141,37 +152,83 @@ def validate_publication_contract(html: str, contract: dict) -> None:
     for forbidden in contract["public_safety"]["forbidden_text"]:
         if forbidden in body:
             raise ValueError(f"공개 안전 위반: 금지 문구 노출 - {forbidden}")
+    probe = _PublishedHTML()
+    probe.feed(html)
+    if probe.public_mode != "public" and not (allow_legacy and probe.public_mode is None):
+        raise ValueError("공개 안전 위반: public 생성 표식이 없습니다. 새 사이트 폴더에서 원본 DB의 보관 날짜 전체를 다시 생성·검토한 후 교체하세요.")
+    if probe.private_markup:
+        raise ValueError("공개 안전 위반: 개인 관심업무·메모 요소가 있습니다.")
+    if probe.unsafe_markup:
+        raise ValueError("공개 안전 위반: 실행 코드·자동 이동·외부 리소스 요소가 있습니다.")
+
+
+class _PublishedHTML(HTMLParser):
+    """문구·CSS가 아닌 실제 링크와 개인용 요소만 읽는다."""
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.urls = set()
+        self.private_markup = False
+        self.public_mode = None
+        self.classes = set()
+        self.tags = set()
+        self.hrefs = []
+        self.unsafe_markup = False
+
+    def handle_starttag(self, tag, attrs):
+        attrs = dict(attrs)
+        self.tags.add(tag)
+        self.classes.update(attrs.get("class", "").split())
+        if (tag in {"script", "iframe", "object", "embed", "form", "base"}
+                or any(name.lower().startswith("on") for name in attrs)
+                or tag == "meta" and "http-equiv" in attrs
+                or any(name in attrs for name in {"srcset", "ping", "poster", "background", "xlink:href"})):
+            self.unsafe_markup = True
+        for name in ("href", "src"):
+            value = (attrs.get(name) or "").strip()
+            try:
+                scheme = urlsplit(value).scheme.lower()
+            except ValueError:
+                scheme = "invalid"
+            image_data = tag == "img" and value.lower().startswith(("data:image/png;", "data:image/jpeg;", "data:image/gif;", "data:image/webp;"))
+            empty_icon = tag == "link" and value == "data:,"
+            if value and (scheme not in {"", "http", "https", "data"}
+                          or (scheme == "data" and not (image_data or empty_icon))
+                          or name == "src" and not image_data
+                          or tag == "link" and not empty_icon):
+                self.unsafe_markup = True
+        if tag == "meta" and attrs.get("name") == "edu-news-mode":
+            self.public_mode = attrs.get("content")
+        if tag == "a":
+            self.hrefs.append(attrs.get("href", ""))
+            url = _normalize_url(attrs.get("href"))
+            if url:
+                self.urls.add(url)
+        if set(attrs.get("class", "").split()) & {"section-interest", "int-list", "int-item", "int-memo"}:
+            self.private_markup = True
 
 
 def _normalize_url(url: str) -> str:
-    return (url or "").strip().rstrip("/")
+    raw = (url or "").strip()
+    try:
+        parts = urlsplit(raw)
+    except ValueError:
+        return ""
+    if parts.scheme.lower() not in {"http", "https"} or not parts.netloc:
+        return ""
+    # Host/scheme are case-insensitive; path and query are not.
+    return urlunsplit((parts.scheme.lower(), parts.netloc.lower(), parts.path or "/", parts.query, ""))
 
 
-def _title_keywords(title: str) -> set:
-    tokens = re.findall(r"[가-힣A-Za-z0-9]{2,}", title or "")
-    return {token for token in tokens if token not in {"인천", "교육청", "인천시"}}
-
-
-def validate_briefing_published_content_parity(briefing_articles: list, published_html: str) -> None:
-    """브리핑 명시 기사가 공개 HTML에 남았는지 URL 우선·제목 보조로 확인한다.
-
-    동일보도 묶음은 대표 URL이 달라질 수 있으므로 URL이 없을 때 제목 핵심어가
-    모두 공개 HTML에 존재하는지 2차 확인한다. 두 방식 모두 실패하면 release를 중단한다.
-    """
+def validate_briefing_published_content_parity(briefing_articles: list, published_html: str,
+                                               represented_by: dict = None) -> None:
+    """실제 href를 정확히 대조한다. 묶음 대체는 호출자가 검증한 명시 관계만 허용한다."""
     missing = []
-    # digest_html._link가 href의 '&'를 '&amp;'로 이스케이프하므로 비교 전에
-    # HTML entity를 복원한다. 제목 fallback은 URL이 대표 URL로 대체된 그룹에만 사용한다.
-    html_lower = _html.unescape(published_html or "").lower()
+    probe = _PublishedHTML()
+    probe.feed(published_html or "")
+    replacements = {_normalize_url(k): _normalize_url(v) for k, v in (represented_by or {}).items()}
     for article in briefing_articles:
         url = _normalize_url(article.get("original_url") or article.get("url"))
-        if url and url.lower() in html_lower:
-            continue
-        keywords = _title_keywords(article.get("title", ""))
-        matched_keywords = {
-            keyword for keyword in keywords if keyword.lower() in html_lower
-        }
-        if (len(matched_keywords) >= 2
-                and len(matched_keywords) / len(keywords) >= 0.6):
+        if url and (url in probe.urls or replacements.get(url) in probe.urls):
             continue
         missing.append(article.get("title") or url or "(제목·URL 없음)")
     if missing:
@@ -212,7 +269,7 @@ def render_archive_index(dates: list) -> str:
 <link rel="icon" href="data:,">
 <title>인천교육 언론보도 브리핑 · 지난 호</title>
 <style>
-  :root {{ color-scheme:light; --blue:#0060B0; --ink:#12233A; --muted:#6b7c8e; --line:#dde5ec; --paper:#eef2f6;
+  :root {{ color-scheme:light; --blue:#0060B0; --ink:#12233A; --muted:#526579; --line:#dde5ec; --paper:#eef2f6;
     --flow:linear-gradient(115deg,#00A160,#0060B0 52%,#17B0D4); }}
   * {{ box-sizing:border-box; }}
   body {{ margin:0; background:var(--paper); color:var(--ink);
@@ -227,8 +284,11 @@ def render_archive_index(dates: list) -> str:
     background:#fff; border:1px solid var(--line); border-radius:12px; text-decoration:none; color:var(--ink);
     transition:transform .12s, box-shadow .12s; }}
   li a:hover {{ transform:translateY(-2px); box-shadow:0 8px 20px rgba(18,35,58,.08); }}
+  a:focus-visible {{ outline:3px solid #0060B0; outline-offset:3px; }}
+  @media (max-width:480px) {{ li a {{ flex-direction:column; gap:4px; }} }}
+  @media (prefers-reduced-motion:reduce) {{ li a {{ transition:none; }} li a:hover {{ transform:none; }} }}
   .d {{ font-weight:800; color:var(--blue); }}
-  .w {{ color:var(--muted); font-size:13.5px; }}
+  .w {{ color:var(--muted); font-size:15px; }}
 </style>
 </head>
 <body>
@@ -281,18 +341,19 @@ def render_issue_page(digest_html: str, current_date: str, dates: list, location
 
     nav_css = '''
   /* EDU_NEWS_SITE_NAV_START */
-  .issue-nav { max-width:1120px; margin:0 auto; padding:14px 22px;
+  .issue-nav { max-width:1320px; margin:0 auto; padding:14px 22px;
     display:grid; grid-template-columns:minmax(0,1fr) auto minmax(0,1fr);
     align-items:center; gap:12px; border-bottom:1px solid var(--line); }
   .issue-nav .nav-btn { display:inline-flex; align-items:center; width:max-content; max-width:100%;
-    padding:7px 12px; border:1px solid var(--line); border-radius:8px; background:var(--card);
-    color:var(--blue); font-size:13px; font-weight:800; line-height:1.35;
+    min-height:44px; padding:10px 14px; border:1px solid var(--line); border-radius:8px; background:var(--card);
+    color:var(--blue); font-size:14px; font-weight:800; line-height:1.35;
     box-shadow:0 1px 2px rgba(18,35,58,.04); }
+  .issue-nav a:focus-visible { outline:3px solid var(--blue); outline-offset:3px; }
   .issue-nav .nav-next { justify-self:end; }
-  .issue-nav .nav-btn.disabled { color:var(--muted); opacity:.52; pointer-events:none; }
+  .issue-nav .nav-btn.disabled { color:var(--muted); background:var(--paper); pointer-events:none; }
   .issue-now { text-align:center; font-size:14px; color:var(--ink); line-height:1.4; }
   .issue-now strong { display:block; font-size:14.5px; font-weight:800; font-variant-numeric:tabular-nums; }
-  .issue-now a { display:inline-block; margin-top:3px; color:var(--muted); font-size:11.5px; font-weight:700; }
+  .issue-now a { display:inline-block; margin-top:3px; color:var(--muted); font-size:14px; font-weight:700; min-height:44px; padding:10px 8px; }
   @media (max-width:720px) {
     .issue-nav { grid-template-columns:1fr 1fr; padding:12px 20px; }
     .issue-now { grid-column:1 / -1; grid-row:1; }
@@ -313,7 +374,7 @@ def render_issue_page(digest_html: str, current_date: str, dates: list, location
         next_html = (f'<a class="nav-btn nav-next" href="{esc(next_href)}">'
                      f'다음 호 ({esc(_fmt_short(next_date))}) ▶</a>')
     else:
-        next_html = '<span class="nav-btn nav-next disabled">다음 호 예정 · 매일 09:00</span>'
+        next_html = '<span class="nav-btn nav-next disabled">다음 호 준비 중</span>'
 
     nav_html = f'''<!-- EDU_NEWS_SITE_NAV_START -->
   <nav class="issue-nav" aria-label="호별 브리핑 이동">
@@ -334,77 +395,264 @@ def existing_dates(site_dir: Path) -> list:
     out = []
     for f in arch.iterdir():
         m = DATE_RE.match(f.name)
-        if m:
+        if m and f.is_file():
             out.append(m.group(1))
     return out
 
 
-def build(site_dir: Path, date_iso: str = None, db_path: str = None):
-    """date_iso 공개 다이제스트를 site/archive에 굽고 최신본을 index.html로, 아카이브 인덱스를 갱신."""
-    site_dir.mkdir(parents=True, exist_ok=True)
-    (site_dir / "archive").mkdir(exist_ok=True)
+def _digest(content: bytes) -> str:
+    return hashlib.sha256(content).hexdigest()
 
+
+def _generated_path(site_dir: Path, relative: str) -> Path:
+    """생성 파일만 허용하며 심볼릭 링크를 통한 외부 쓰기를 막는다."""
+    path = Path(relative)
+    if relative not in {"index.html", "archive/index.html", MANIFEST_NAME} and not (
+            len(path.parts) == 2 and path.parts[0] == "archive" and DATE_RE.fullmatch(path.name)):
+        raise ValueError(f"게시 파일 목록에 허용되지 않은 경로: {relative}")
+    target = site_dir / path
+    if target.is_symlink() or not target.resolve().is_relative_to(site_dir.resolve()):
+        raise ValueError(f"게시 파일 경로가 사이트 밖을 가리킵니다: {relative}")
+    return target
+
+
+def _load_manifest(site_dir: Path) -> dict | None:
+    path = _generated_path(site_dir, MANIFEST_NAME)
+    if not path.exists():
+        return None
+    manifest = json.loads(path.read_text(encoding="utf-8"))
+    if (manifest.get("schema_version") != 1 or manifest.get("mode") != "public"
+            or manifest.get("generator") != MANIFEST_GENERATOR
+            or not isinstance(manifest.get("files"), dict)):
+        raise ValueError("공개 생성 목록 형식·출처가 올바르지 않습니다.")
+    for relative in manifest["files"]:
+        _generated_path(site_dir, relative)
+    return manifest
+
+
+def _validate_legacy_public(html: str, contract: dict) -> _PublishedHTML:
+    """명시 이관에만 사용하는 구 생성기 구조·공개 경계 검사."""
+    validate_publication_contract(html, contract, allow_legacy=True)
+    probe = _PublishedHTML()
+    probe.feed(html)
+    required_classes = {"masthead", "mast-inner", "mast-title", "unofficial", "wrap", "foot"}
+    allowed_tags = {"html", "head", "meta", "link", "title", "style", "body", "div", "img",
+                    "p", "h1", "h2", "h3", "main", "section", "span", "article", "header",
+                    "b", "strong", "em", "small", "br", "footer", "ul", "li", "a", "nav",
+                    "details", "summary"}
+    if (not required_classes.issubset(probe.classes)
+            or not probe.tags.issubset(allowed_tags)
+            or not {"h1", "main", "footer"}.issubset(probe.tags)
+            or "인천광역시교육청의 공식 발행물이 아닙니다" not in html
+            or "동일보도는 대표기사 1건으로 묶고 관련 매체를 병기했습니다" not in html
+            or re.search(r"(?i)@import|url\(\s*['\"]?\s*(?:https?:|//)", html)
+            or probe.unsafe_markup):
+        raise ValueError("구형 공개본의 생성기 구조·비공식 고지·안전 요소를 확인할 수 없습니다.")
+    return probe
+
+
+def adopt_legacy_public(site_dir: Path, *, dry_run: bool = True, expected_files: dict = None) -> dict:
+    """HTML을 수정하지 않고 명시 검토된 구형 공개본의 hash 목록만 만든다.
+
+    기본은 dry-run이다. 검토한 후보의 files를 expected_files로 넘기면 검토 후 변경도 차단한다.
+    """
+    site_dir = Path(site_dir).resolve()
+    if (site_dir / MANIFEST_NAME).exists():
+        raise ValueError("기존 공개 생성 목록이 있습니다. 이관으로 기존 검증 기록을 덮어쓸 수 없습니다.")
+    contract = load_publication_contract()
+    dates = sorted(existing_dates(site_dir), reverse=True)
+    if not dates:
+        raise ValueError("이관할 날짜별 보관본이 없습니다.")
+    files, sources, probes = {}, {}, {}
+    for date in dates:
+        relative = f"archive/{date}.html"
+        content = _generated_path(site_dir, relative).read_bytes()
+        probes[date] = _validate_legacy_public(content.decode("utf-8"), contract)
+        files[relative] = _digest(content)
+        sources[relative] = "legacy-public-reviewed"
+    root = _generated_path(site_dir, "index.html").read_bytes()
+    root_probe = _validate_legacy_public(root.decode("utf-8"), contract)
+    if root_probe.urls != probes[dates[0]].urls:
+        raise ValueError("루트와 최신 보관본의 기사 링크가 다릅니다. 이관 전에 내용을 확인하세요.")
+    files["index.html"] = _digest(root)
+    sources["index.html"] = "legacy-public-reviewed"
+    archive_index = _generated_path(site_dir, "archive/index.html").read_bytes()
+    index_html = archive_index.decode("utf-8")
+    probe = _PublishedHTML()
+    probe.feed(index_html)
+    expected_hrefs = {"../index.html", *(f"{date}.html" for date in dates)}
+    if (probe.unsafe_markup or probe.private_markup or set(probe.hrefs) != expected_hrefs
+            or "<h1>지난 호 보기</h1>" not in index_html
+            or contract["public_safety"]["required_marker"] not in index_html):
+        raise ValueError("지난 호 목록의 구조·공개 고지·날짜 링크를 확인할 수 없습니다.")
+    files["archive/index.html"] = _digest(archive_index)
+    sources["archive/index.html"] = "legacy-public-reviewed"
+    if expected_files is not None and files != expected_files:
+        raise ValueError("이관 후보 검토 이후 파일이 변경됐습니다. 다시 검토하세요.")
+    manifest = {"schema_version": 1, "generator": MANIFEST_GENERATOR, "mode": "public",
+                "source": "legacy-public-reviewed", "contract_id": contract["contract_id"],
+                "dates": dates, "files": files, "sources": sources}
+    if not dry_run:
+        _write_site_transaction(site_dir, {
+            MANIFEST_NAME: (json.dumps(manifest, ensure_ascii=False, indent=2) + "\n").encode("utf-8")})
+    return manifest
+
+
+def _write_site_transaction(site_dir: Path, outputs: dict) -> None:
+    """모든 파일을 먼저 준비하고, 교체 중 오류가 나면 기존 바이트로 복구한다."""
+    site_dir.mkdir(parents=True, exist_ok=True)
+    stage = Path(tempfile.mkdtemp(prefix=".edu-news-stage-", dir=site_dir.parent))
+    installed = []
+    recoverable = True
+    try:
+        for relative, content in outputs.items():
+            target = _generated_path(site_dir, relative)
+            prepared = stage / "new" / relative
+            prepared.parent.mkdir(parents=True, exist_ok=True)
+            prepared.write_bytes(content)
+            if target.exists():
+                backup = stage / "old" / relative
+                backup.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(target, backup)
+        for relative in outputs:
+            target = _generated_path(site_dir, relative)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            os.replace(stage / "new" / relative, target)
+            installed.append(relative)
+    except Exception:
+        failures = []
+        for relative in reversed(installed):
+            backup = stage / "old" / relative
+            try:
+                target = _generated_path(site_dir, relative)
+                if backup.exists():
+                    os.replace(backup, target)
+                else:
+                    target.unlink()
+            except Exception as error:
+                failures.append(str(error))
+        if failures:
+            recoverable = False
+            raise RuntimeError(f"게시 교체와 복구 실패. 복구용 원본을 보존했습니다: {stage}")
+        raise
+    finally:
+        if recoverable:
+            shutil.rmtree(stage)
+
+
+def build(site_dir: Path, date_iso: str = None, db_path: str = None):
+    """전체 공개 파일을 검증·준비한 뒤 교체한다. 실사용 DB는 날짜 생성 때만 연다."""
+    site_dir = Path(site_dir).resolve()
+    contract = load_publication_contract()
+    manifest = _load_manifest(site_dir)
+    archives = {}
+    archive_sources = {}
     if date_iso:
-        contract = load_publication_contract()
+        datetime.strptime(date_iso, "%Y-%m-%d")
+        if not DATE_RE.fullmatch(f"{date_iso}.html"):
+            raise ValueError("게시 날짜는 YYYY-MM-DD 형식이어야 합니다.")
+    for archived_date in existing_dates(site_dir):
+        if archived_date == date_iso:
+            continue
+        relative = f"archive/{archived_date}.html"
+        content = _generated_path(site_dir, relative).read_bytes()
+        if manifest is not None and manifest["files"].get(relative) != _digest(content):
+            raise ValueError(f"공개 보관본 무결성 확인 실패: {relative}. 원본에서 다시 생성하세요.")
+        archived_html = content.decode("utf-8")
+        legacy = manifest is not None and manifest.get("sources", {}).get(relative) == "legacy-public-reviewed"
+        if legacy:
+            _validate_legacy_public(archived_html, contract)
+        else:
+            validate_publication_contract(archived_html, contract)
+        archives[archived_date] = archived_html
+        archive_sources[archived_date] = "legacy-public-reviewed" if legacy else "generated-public"
+    if date_iso:
         conn = newsdb.open_db(db_path)
         try:
             validate_ingestion_contract(conn, date_iso, contract)
             validate_grouping_state(conn, date_iso)
             html = newsdb.render_digest_html(newsdb.build_digest_data(conn, date_iso), public=True)
             validate_publication_contract(html, contract)
-            briefing_articles = [
-                dict(row) for row in conn.execute(
-                    "SELECT DISTINCT a.title, a.original_url "
-                    "FROM articles a JOIN article_selections s ON s.article_id = a.article_id "
-                    "WHERE s.batch_date = ? AND s.source_kind IN ('briefing-md', 'paste') "
-                    "ORDER BY s.input_order, a.article_id",
-                    (date_iso,),
-                ).fetchall()
-            ]
+            briefing_articles = [{"title": row["title"], "original_url": row["original_url"]}
+                                 for row in newsdb.search_articles(
+                                     conn, date=date_iso, selected=True, include_excluded=True, limit=-1)
+                                 if row["source_kind"] in {"briefing-md", "paste"}]
             validate_briefing_published_content_parity(briefing_articles, html)
         finally:
             conn.close()
-        (site_dir / "archive" / f"{date_iso}.html").write_text(html, encoding="utf-8", newline="\n")
-
-    dates = sorted(set(existing_dates(site_dir)), reverse=True)
+        archives[date_iso] = html
+        archive_sources[date_iso] = "generated-public"
+    dates = sorted(archives, reverse=True)
+    if not dates and (site_dir / "index.html").exists():
+        raise ValueError("보관본 없는 기존 index.html은 공개 여부를 확인할 수 없습니다. 원본 날짜를 지정해 다시 생성하세요.")
+    outputs = {}
+    sources = {}
     if dates:
-        # 모든 보관본을 다시 장식해야 새 호 추가 시 과거 페이지의 다음 호 링크도 갱신된다.
         for archived_date in dates:
-            archived_path = site_dir / "archive" / f"{archived_date}.html"
-            archived_html = archived_path.read_text(encoding="utf-8")
-            archived_path.write_text(
-                render_issue_page(archived_html, archived_date, dates, location="archive"),
-                encoding="utf-8",
-                newline="\n",
-            )
-
+            html = render_issue_page(archives[archived_date], archived_date, dates, location="archive")
+            validate_publication_contract(html, contract, allow_legacy=archive_sources[archived_date] == "legacy-public-reviewed")
+            outputs[f"archive/{archived_date}.html"] = html.encode("utf-8")
+            sources[f"archive/{archived_date}.html"] = archive_sources[archived_date]
         latest = dates[0]
-        latest_html = (site_dir / "archive" / f"{latest}.html").read_text(encoding="utf-8")
-        (site_dir / "index.html").write_text(
-            render_issue_page(latest_html, latest, dates, location="root"),
-            encoding="utf-8",
-            newline="\n",
-        )
-    (site_dir / "archive" / "index.html").write_text(render_archive_index(dates), encoding="utf-8", newline="\n")
+        html = render_issue_page(archives[latest], latest, dates, location="root")
+        validate_publication_contract(html, contract, allow_legacy=archive_sources[latest] == "legacy-public-reviewed")
+        outputs["index.html"] = html.encode("utf-8")
+        sources["index.html"] = archive_sources[latest]
+    outputs["archive/index.html"] = render_archive_index(dates).encode("utf-8")
+    sources["archive/index.html"] = "generated-public"
+    new_manifest = {"schema_version": 1, "generator": MANIFEST_GENERATOR, "mode": "public",
+                    "contract_id": contract["contract_id"], "dates": dates,
+                    "files": {name: _digest(content) for name, content in outputs.items()}, "sources": sources}
+    outputs[MANIFEST_NAME] = (json.dumps(new_manifest, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
+    _write_site_transaction(site_dir, outputs)
     return dates
 
 
+def _git(site_dir: Path, *args) -> str:
+    command = ["git", *args]
+    r = subprocess.run(command, cwd=str(site_dir), capture_output=True, text=True,
+                       encoding="utf-8", errors="replace")
+    if r.returncode != 0:
+        detail = r.stderr.strip() or r.stdout.strip() or f"exit code {r.returncode}"
+        raise RuntimeError(f"[git] {' '.join(command)} 실패: {detail}")
+    return r.stdout
+
+
 def git_push(site_dir: Path, date_iso: str):
+    """검증된 생성 목록만 커밋한다. 기존 staged 변경과 다른 대상 브랜치는 거부한다."""
+    site_dir = Path(site_dir).resolve()
+    repo = Path(_git(site_dir, "rev-parse", "--show-toplevel").strip()).resolve()
+    if not site_dir.is_relative_to(repo):
+        raise RuntimeError("게시 디렉터리가 확인된 Git 저장소 안에 없습니다.")
+    branch = _git(site_dir, "symbolic-ref", "--quiet", "--short", "HEAD").strip()
+    upstream = _git(site_dir, "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}").strip()
+    remote, separator, remote_branch = upstream.partition("/")
+    if not branch or not separator or branch != remote_branch:
+        raise RuntimeError("현재 브랜치와 게시 upstream 브랜치가 일치하지 않습니다.")
+    if _git(site_dir, "rev-list", "@{upstream}..HEAD").strip():
+        raise RuntimeError("미게시 로컬 커밋이 있습니다. 포함 범위를 별도로 검토한 후 게시하세요.")
+    if _git(site_dir, "diff", "--cached", "--name-only", "-z").strip("\0\n"):
+        raise RuntimeError("기존 staged 변경이 있습니다. 먼저 별도로 정리한 후 게시하세요.")
+    manifest = _load_manifest(site_dir)
+    if manifest is None:
+        raise ValueError("검증된 공개 생성 목록이 없습니다. 먼저 build를 실행하세요.")
+    generated = []
+    for relative, expected in manifest["files"].items():
+        path = _generated_path(site_dir, relative)
+        if not path.is_file() or _digest(path.read_bytes()) != expected:
+            raise ValueError(f"공개 생성 파일 무결성 확인 실패: {relative}")
+        generated.append(path.relative_to(repo).as_posix())
+    generated.append((site_dir / MANIFEST_NAME).relative_to(repo).as_posix())
+    generated.sort()
+    _git(repo, "add", "--", *generated)
+    staged = set(filter(None, _git(repo, "diff", "--cached", "--name-only", "-z").split("\0")))
+    if not staged.issubset(set(generated)):
+        raise RuntimeError("게시 파일 이외 staged 변경을 발견해 커밋을 중단했습니다.")
+    if not staged:
+        return
     date_label = date_iso or datetime.now().strftime("%Y-%m-%d")
-    for args in (["git", "add", "-A"],
-                 ["git", "commit", "-m", f"다이제스트 갱신: {date_label}"],
-                 ["git", "push"]):
-        r = subprocess.run(
-            args,
-            cwd=str(site_dir),
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-        )
-        if r.returncode != 0 and "nothing to commit" not in (r.stdout + r.stderr):
-            detail = r.stderr.strip() or r.stdout.strip() or f"exit code {r.returncode}"
-            raise RuntimeError(f"[git] {' '.join(args)} 실패: {detail}")
+    _git(repo, "commit", "-m", f"다이제스트 갱신: {date_label}")
+    _git(repo, "push", "--", remote, f"HEAD:refs/heads/{remote_branch}")
 
 
 def main(argv=None):
@@ -413,10 +661,20 @@ def main(argv=None):
     ap.add_argument("--date", help="구울 날짜 YYYY-MM-DD")
     ap.add_argument("--db")
     ap.add_argument("--rebuild-index", action="store_true", help="기존 아카이브로 index만 재생성")
+    ap.add_argument("--adopt-legacy-public", action="store_true", help="구형 공개본 검토 후 HTML 변경 없이 검증 목록만 생성")
+    ap.add_argument("--dry-run", action="store_true", help="--adopt-legacy-public의 검증 후보만 출력, 파일 쓰기 없음")
     ap.add_argument("--push", action="store_true", help="빌드 후 git add/commit/push")
     args = ap.parse_args(argv)
 
     site_dir = Path(args.site_dir)
+    if args.adopt_legacy_public:
+        if args.date or args.db or args.rebuild_index or args.push:
+            ap.error("구형 공개본 이관은 --date/--db/--rebuild-index/--push와 함께 실행할 수 없습니다.")
+        manifest = adopt_legacy_public(site_dir, dry_run=args.dry_run)
+        print(json.dumps(manifest, ensure_ascii=False, indent=2))
+        return
+    if args.dry_run:
+        ap.error("--dry-run은 --adopt-legacy-public과 함께 사용하세요.")
     date_iso = None if args.rebuild_index else args.date
     dates = build(site_dir, date_iso=date_iso, db_path=args.db)
     print(f"빌드 완료: {site_dir} (아카이브 {len(dates)}일, 최신 {dates[0] if dates else '없음'})")

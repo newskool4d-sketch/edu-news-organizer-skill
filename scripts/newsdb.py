@@ -8,6 +8,7 @@
 """
 import argparse
 import csv
+import hashlib
 import json
 import os
 import re
@@ -209,21 +210,21 @@ def _preferred_selection_predicate(selection_alias: str = "s") -> str:
 
 
 def build_groups(conn, batch_date: str) -> int:
-    """같은 날짜 기사 중 유사 제목을 묶어 article_groups에 저장. 재실행 시 해당 날짜 그룹 재생성.
+    """같은 날짜 기사 중 유사 제목을 묶되 동일 묶음의 수동 편집은 보존한다.
 
     반환: 생성된 그룹(2건 이상 묶음) 수. 단독 기사는 그룹을 만들지 않는다.
     """
-    # 멱등성: 이 날짜 기사가 속한 기존 그룹 제거 후 재생성
-    old = [r[0] for r in conn.execute(
-        "SELECT group_id FROM article_groups WHERE batch_date = ?",
-        (batch_date,)).fetchall()]
-    if old:
-        marks = ",".join("?" * len(old))
-        conn.execute(f"DELETE FROM article_group_items WHERE group_id IN ({marks})", old)
-        conn.execute(f"DELETE FROM article_groups WHERE group_id IN ({marks})", old)
+    old_groups = [dict(r) for r in conn.execute(
+        "SELECT * FROM article_groups WHERE batch_date = ?", (batch_date,))]
+    for group in old_groups:
+        group["member_ids"] = frozenset(r[0] for r in conn.execute(
+            "SELECT article_id FROM article_group_items WHERE group_id = ?",
+            (group["group_id"],)))
+    old_by_members = {g["member_ids"]: g for g in old_groups}
 
     rows = conn.execute(
-        "SELECT a.article_id, a.title, a.published_at, s.input_order, "
+        "SELECT a.article_id, COALESCE(s.article_title, a.title) AS title, "
+        "COALESCE(s.published_at, a.published_at) AS published_at, s.input_order, "
         "s.source_kind AS origin_source_kind "
         "FROM article_selections s JOIN articles a ON a.article_id = s.article_id "
         "WHERE s.batch_date = ? AND " + _preferred_selection_predicate("s")
@@ -285,31 +286,91 @@ def build_groups(conn, batch_date: str) -> int:
     for r in rows:
         clusters.setdefault(find(r["article_id"]), []).append(r)
 
-    made = 0
-    for members in clusters.values():
-        if len(members) < 2:
-            continue
-        # 대표기사: 브리핑 명시 기사 우선, 그 안에서는 발행시각·입력 순서 적용
-        rep = min(members, key=lambda r: (
-            0 if r["origin_source_kind"] in DIGEST_SOURCE_PRIORITY else 1,
-            r["published_at"] or "9999",
-            r["input_order"],
-        ))
-        cur = conn.execute(
-            "INSERT INTO article_groups(batch_date, group_title, summary, category, article_type, priority, "
-            "representative_article_id, created_at, updated_at) VALUES (?, ?, '', ?, ?, 0, ?, ?, ?)",
-            (batch_date, rep["title"], ",".join(classify_fields(rep["title"])), classify_type(rep["title"]),
-             rep["article_id"], _now(), _now()))
-        gid = cur.lastrowid
-        for m in members:
-            conn.execute(
-                "INSERT OR IGNORE INTO article_group_items(group_id, article_id, similarity_type, similarity_score) "
-                "VALUES (?, ?, 'title', ?)",
-                (gid, m["article_id"],
-                 title_similarity(rep["title"], m["title"])))
-        made += 1
-    conn.commit()
+    made, retained = 0, set()
+    conn.execute("SAVEPOINT rebuild_groups")
+    try:
+        for members in clusters.values():
+            if len(members) < 2:
+                continue
+            # 대표기사: 브리핑 명시 기사 우선, 그 안에서는 발행시각·입력 순서 적용
+            rep = min(members, key=lambda r: (
+                0 if r["origin_source_kind"] in DIGEST_SOURCE_PRIORITY else 1,
+                r["published_at"] or "9999",
+                r["input_order"],
+            ))
+            member_ids = frozenset(m["article_id"] for m in members)
+            fingerprint = _group_content_fingerprint(members)
+            previous = old_by_members.get(member_ids)
+            if previous:
+                gid = previous["group_id"]
+                retained.add(gid)
+                content_changed = bool(previous["content_fingerprint"]
+                                       and previous["content_fingerprint"] != fingerprint)
+                if content_changed:
+                    _archive_group_summary(conn, previous, "article_content_changed")
+                    conn.execute(
+                        "UPDATE article_groups SET group_title = ?, summary = '', summary_needs_review = ?, "
+                        "representative_article_id = ?, content_fingerprint = ?, updated_at = ? WHERE group_id = ?",
+                        (rep["title"], int(bool(previous["summary"] or previous["summary_needs_review"])),
+                         rep["article_id"], fingerprint, _now(), gid))
+                else:
+                    # 발행시각·입력 우선순위가 바뀌면 동일 내용 묶음에서도
+                    # 대표기사는 다시 고른다. 담당자가 바꾼 제목은 보존하고,
+                    # 이전 대표 제목을 그대로 쓴 자동 제목만 새 대표에 맞춘다.
+                    group_title = previous["group_title"]
+                    if group_title == titles.get(previous["representative_article_id"]):
+                        group_title = rep["title"]
+                    conn.execute(
+                        "UPDATE article_groups SET group_title = ?, representative_article_id = ?, "
+                        "content_fingerprint = ?, updated_at = ? WHERE group_id = ?",
+                        (group_title, rep["article_id"], fingerprint, _now(), gid))
+                conn.execute("DELETE FROM article_group_items WHERE group_id = ?", (gid,))
+            else:
+                needs_review = any(g["member_ids"] & member_ids
+                                   and (g["summary"] or g["summary_needs_review"]) for g in old_groups)
+                cur = conn.execute(
+                    "INSERT INTO article_groups(batch_date, group_title, summary, category, article_type, priority, "
+                    "representative_article_id, created_at, updated_at, content_fingerprint, summary_needs_review) "
+                    "VALUES (?, ?, '', ?, ?, 0, ?, ?, ?, ?, ?)",
+                    (batch_date, rep["title"], ",".join(classify_fields(rep["title"])), classify_type(rep["title"]),
+                     rep["article_id"], _now(), _now(), fingerprint, int(needs_review)))
+                gid = cur.lastrowid
+            for m in members:
+                conn.execute(
+                    "INSERT OR IGNORE INTO article_group_items(group_id, article_id, similarity_type, similarity_score) "
+                    "VALUES (?, ?, 'title', ?)",
+                    (gid, m["article_id"], title_similarity(rep["title"], m["title"])))
+            made += 1
+        for previous in old_groups:
+            if previous["group_id"] not in retained:
+                _archive_group_summary(conn, previous, "group_members_changed")
+                conn.execute("DELETE FROM article_group_items WHERE group_id = ?", (previous["group_id"],))
+                conn.execute("DELETE FROM article_groups WHERE group_id = ?", (previous["group_id"],))
+        conn.execute("RELEASE SAVEPOINT rebuild_groups")
+        conn.commit()
+    except Exception:
+        conn.execute("ROLLBACK TO SAVEPOINT rebuild_groups")
+        conn.execute("RELEASE SAVEPOINT rebuild_groups")
+        raise
     return made
+
+
+def _archive_group_summary(conn, group: dict, reason: str):
+    """재구성으로 공개에서 빠지는 수동 요약을 로컬 이력에 보존한다."""
+    if not group["summary"]:
+        return
+    conn.execute(
+        "INSERT INTO group_summary_history(group_id, batch_date, members_json, group_title, summary, "
+        "category, article_type, priority, reason, archived_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (group["group_id"], group["batch_date"], json.dumps(sorted(group["member_ids"])),
+         group["group_title"], group["summary"], group["category"], group["article_type"],
+         group["priority"], reason, _now()))
+
+
+def _group_content_fingerprint(members) -> str:
+    return hashlib.sha256(json.dumps(
+        sorted((m["article_id"], m["title"]) for m in members),
+        ensure_ascii=False).encode("utf-8")).hexdigest()
 
 
 def _header_to_batch(m: re.Match):
@@ -485,6 +546,13 @@ CREATE TABLE IF NOT EXISTS article_selections (
     publication_eligible INTEGER NOT NULL DEFAULT 0,
     publication_verification_basis TEXT DEFAULT '',
     publication_verified_at TEXT DEFAULT '',
+    article_title TEXT,
+    publisher TEXT,
+    publisher_domain TEXT,
+    original_url TEXT,
+    published_at TEXT,
+    article_type TEXT,
+    edu_fields TEXT,
     PRIMARY KEY(article_id, batch_date, list_type)
 );
 CREATE TABLE IF NOT EXISTS legacy_candidate_selections (
@@ -527,6 +595,8 @@ CREATE TABLE IF NOT EXISTS article_groups (
     category TEXT DEFAULT '',
     article_type TEXT DEFAULT '',
     priority INTEGER DEFAULT 0,
+    summary_needs_review INTEGER NOT NULL DEFAULT 0,
+    content_fingerprint TEXT NOT NULL DEFAULT '',
     representative_article_id INTEGER,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
@@ -537,6 +607,19 @@ CREATE TABLE IF NOT EXISTS article_group_items (
     similarity_type TEXT DEFAULT '',
     similarity_score REAL DEFAULT 0,
     UNIQUE(group_id, article_id)
+);
+CREATE TABLE IF NOT EXISTS group_summary_history (
+    history_id INTEGER PRIMARY KEY,
+    group_id INTEGER NOT NULL,
+    batch_date TEXT NOT NULL,
+    members_json TEXT NOT NULL,
+    group_title TEXT NOT NULL,
+    summary TEXT NOT NULL,
+    category TEXT DEFAULT '',
+    article_type TEXT DEFAULT '',
+    priority INTEGER DEFAULT 0,
+    reason TEXT NOT NULL,
+    archived_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_articles_batch_date ON articles(batch_date);
 CREATE INDEX IF NOT EXISTS idx_articles_title ON articles(title);
@@ -581,6 +664,12 @@ def open_db(db_path: str = None) -> sqlite3.Connection:
             "UPDATE article_groups SET batch_date = COALESCE((SELECT a.batch_date FROM articles a "
             "WHERE a.article_id = article_groups.representative_article_id), '')"
         )
+    for name, definition in {
+        "summary_needs_review": "INTEGER NOT NULL DEFAULT 0",
+        "content_fingerprint": "TEXT NOT NULL DEFAULT ''",
+    }.items():
+        if name not in group_cols:
+            conn.execute(f"ALTER TABLE article_groups ADD COLUMN {name} {definition}")
     metadata_columns = {
         "relevance_hint": "TEXT DEFAULT ''",
         "relevance_reasons": "TEXT DEFAULT '[]'",
@@ -603,6 +692,13 @@ def open_db(db_path: str = None) -> sqlite3.Connection:
         "publication_eligible": "INTEGER NOT NULL DEFAULT 0",
         "publication_verification_basis": "TEXT DEFAULT ''",
         "publication_verified_at": "TEXT DEFAULT ''",
+        "article_title": "TEXT",
+        "publisher": "TEXT",
+        "publisher_domain": "TEXT",
+        "original_url": "TEXT",
+        "published_at": "TEXT",
+        "article_type": "TEXT",
+        "edu_fields": "TEXT",
     }
     for name, definition in selection_metadata_columns.items():
         if name not in selection_columns:
@@ -694,6 +790,23 @@ def open_db(db_path: str = None) -> sqlite3.Connection:
         "(SELECT 1 FROM article_selections s WHERE s.article_id = articles.article_id) "
         "THEN 1 ELSE 0 END"
     )
+    # 기존 관계도 최초 마이그레이션 시 현재 표시값을 고정한다. 이후 날짜의
+    # 기사 정정이 과거 선택의 제목·매체·분류를 소급해 바꾸지 않도록 한다.
+    for selection_name, article_name in SELECTION_SNAPSHOT_FIELDS.items():
+        conn.execute(
+            f"UPDATE article_selections SET {selection_name} = "
+            f"(SELECT a.{article_name} FROM articles a WHERE a.article_id = article_selections.article_id) "
+            f"WHERE {selection_name} IS NULL")
+    for group in conn.execute(
+            "SELECT group_id, batch_date FROM article_groups WHERE content_fingerprint = ''").fetchall():
+        members = conn.execute(
+            "SELECT a.article_id, COALESCE(s.article_title, a.title) AS title "
+            "FROM article_group_items i JOIN articles a ON a.article_id = i.article_id "
+            "LEFT JOIN article_selections s ON s.article_id = a.article_id AND s.batch_date = ? AND "
+            + _preferred_selection_predicate("s") + " WHERE i.group_id = ?",
+            (group["batch_date"], group["group_id"])).fetchall()
+        conn.execute("UPDATE article_groups SET content_fingerprint = ? WHERE group_id = ?",
+                     (_group_content_fingerprint(members), group["group_id"]))
     conn.commit()
     return conn
 
@@ -707,6 +820,17 @@ def _json_list(value) -> str:
     if isinstance(value, str):
         return value
     return json.dumps(value if isinstance(value, list) else [], ensure_ascii=False)
+
+
+SELECTION_SNAPSHOT_FIELDS = {
+    "article_title": "title",
+    "publisher": "publisher",
+    "publisher_domain": "publisher_domain",
+    "original_url": "original_url",
+    "published_at": "published_at",
+    "article_type": "article_type",
+    "edu_fields": "edu_fields",
+}
 
 
 def ingest_articles(conn, batch_date, list_type, articles, source_kind, raw_text):
@@ -750,6 +874,7 @@ def ingest_articles(conn, batch_date, list_type, articles, source_kind, raw_text
             and bool(publication_verified_at)
         )
         publishable = source_kind in DIGEST_SOURCE_PRIORITY or publication_eligible
+        existing = None
         cur = conn.execute(
             "INSERT OR IGNORE INTO articles(batch_id, batch_date, list_type, title, publisher, "
             "publisher_domain, original_url, clean_url, published_at, body_status, "
@@ -774,7 +899,7 @@ def ingest_articles(conn, batch_date, list_type, articles, source_kind, raw_text
         else:
             dup += 1
             existing = conn.execute(
-                "SELECT a.article_id, a.published_at, a.engine, a.queries, sb.source_kind FROM articles a "
+                "SELECT a.article_id, a.batch_date, a.published_at, a.engine, a.queries, sb.source_kind FROM articles a "
                 "JOIN source_batches sb ON sb.batch_id = a.batch_id WHERE a.clean_url = ?",
                 (clean_url(url),)
             ).fetchone()
@@ -784,7 +909,10 @@ def ingest_articles(conn, batch_date, list_type, articles, source_kind, raw_text
             old_rank = (DIGEST_SOURCE_PRIORITY.index(old_kind)
                         if old_kind in DIGEST_SOURCE_PRIORITY else len(DIGEST_SOURCE_PRIORITY))
             article_id = existing["article_id"] if existing else None
-            if existing and source_kind in DIGEST_SOURCE_PRIORITY and new_rank < old_rank:
+            # 동일 우선순위의 최신 입력은 정정으로 반영한다. 더 과거 날짜의
+            # 재입력은 최신 표시값을 덮지 않고 아래 날짜별 스냅샷만 갱신한다.
+            if existing and (new_rank < old_rank or (
+                    new_rank == old_rank and batch_date >= existing["batch_date"])):
                 conn.execute(
                     "UPDATE articles SET batch_id = ?, batch_date = ?, list_type = ?, title = ?, "
                     "publisher = ?, publisher_domain = ?, original_url = ?, published_at = ?, "
@@ -804,13 +932,12 @@ def ingest_articles(conn, batch_date, list_type, articles, source_kind, raw_text
                     "UPDATE articles SET relevance_hint = ?, relevance_reasons = ?, location_hits = ?, "
                     "education_subject_hits = ?, student_story_hits = ?, negative_context_hits = ?, "
                     "publication_eligible = ?, body_status = ?, publication_verification_basis = ?, "
-                    "publication_verified_at = ?, article_type = ?, edu_fields = ? WHERE article_id = ?",
+                    "publication_verified_at = ? WHERE article_id = ?",
                     (a.get("relevance_hint", ""), _json_list(a.get("relevance_reasons")),
                      _json_list(a.get("location_hits")), _json_list(a.get("education_subject_hits")),
                      _json_list(a.get("student_story_hits")), _json_list(a.get("negative_context_hits")),
                      int(publication_eligible), body_status, publication_verification_basis,
-                     publication_verified_at,
-                     classify_type(title), ",".join(classify_fields(title)), existing["article_id"])
+                     publication_verified_at, existing["article_id"])
                 )
         if publishable and article_id:
             current_selection = conn.execute(
@@ -824,8 +951,9 @@ def ingest_articles(conn, batch_date, list_type, articles, source_kind, raw_text
                 conn.execute(
                     "INSERT OR REPLACE INTO article_selections(article_id, batch_date, list_type, "
                     "source_kind, input_order, selected_at, relevance_hint, body_status, publication_eligible, "
-                    "publication_verification_basis, publication_verified_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    "publication_verification_basis, publication_verified_at, article_title, publisher, "
+                    "publisher_domain, original_url, published_at, article_type, edu_fields) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (
                         article_id, batch_date, list_type, source_kind, order, _now(),
                         a.get("relevance_hint", ""),
@@ -833,6 +961,10 @@ def ingest_articles(conn, batch_date, list_type, articles, source_kind, raw_text
                         int(publication_eligible),
                         publication_verification_basis,
                         publication_verified_at,
+                        title, a.get("publisher", ""),
+                        a.get("publisher_domain", "") or urllib.parse.urlsplit(url).netloc,
+                        url, a.get("published_at", "") or (existing["published_at"] if existing else ""),
+                        classify_type(title), ",".join(classify_fields(title)),
                     )
                 )
     if source_kind in DIGEST_SOURCE_PRIORITY or source_kind == "collector-json":
@@ -846,7 +978,8 @@ def ingest_articles(conn, batch_date, list_type, articles, source_kind, raw_text
 
 
 def add_interest(conn, keyword, category="", weight=1):
-    conn.execute("INSERT OR IGNORE INTO interests(keyword, category, weight, created_at) VALUES (?, ?, ?, ?)",
+    conn.execute("INSERT INTO interests(keyword, category, weight, created_at) VALUES (?, ?, ?, ?) "
+                 "ON CONFLICT(keyword) DO UPDATE SET active = 1",
                  (keyword.strip(), category, weight, _now()))
     conn.commit()
 
@@ -891,6 +1024,7 @@ def search_articles(conn, q=None, date=None, list_type=None, publisher=None,
 
     selected=True에서 날짜를 생략하면 기사 고유 목록이 아니라 날짜·목록별 선별 이력을 반환한다.
     """
+    use_snapshot = selected or bool(date)
     selection_fields = (", s.batch_date AS selection_batch_date, "
                         "s.list_type AS selection_list_type, s.input_order AS selection_input_order, "
                         "s.source_kind AS selection_source_kind, "
@@ -899,47 +1033,63 @@ def search_articles(conn, q=None, date=None, list_type=None, publisher=None,
                         "s.publication_eligible AS selection_publication_eligible, "
                         "s.publication_verification_basis AS selection_publication_verification_basis, "
                         "s.publication_verified_at AS selection_publication_verified_at "
-                        if selected else "")
-    selection_join = (" JOIN article_selections s ON s.article_id = a.article_id AND "
-                      + _preferred_selection_predicate("s") + " "
-                      if selected else " ")
+                        if use_snapshot else "")
+    if use_snapshot:
+        selection_fields += "".join(
+            f", s.{selection_name} AS snapshot_{article_name} "
+            for selection_name, article_name in SELECTION_SNAPSHOT_FIELDS.items())
+    vals = []
+    if selected:
+        selection_join = (" JOIN article_selections s ON s.article_id = a.article_id AND "
+                          + _preferred_selection_predicate("s") + " ")
+    elif date:
+        selection_join = (" LEFT JOIN article_selections s ON s.article_id = a.article_id "
+                          "AND s.batch_date = ? AND " + _preferred_selection_predicate("s") + " ")
+        vals.append(date)
+    else:
+        selection_join = " "
+
+    def display_field(name):
+        selection_name = "article_title" if name == "title" else name
+        return f"COALESCE(s.{selection_name}, a.{name})" if use_snapshot else f"a.{name}"
+
+    source_field = "COALESCE(s.source_kind, sb.source_kind)" if use_snapshot else "sb.source_kind"
     sql = ("SELECT a.*, COALESCE(u.read_status, 'unread') AS read_status, "
            "COALESCE(u.favorite, 0) AS favorite, COALESCE(u.excluded, 0) AS excluded, "
            "COALESCE(u.memo, '') AS memo, COALESCE(u.user_category, '') AS user_category, "
-           + ("s.source_kind AS source_kind " if selected else "sb.source_kind AS source_kind ")
+           + source_field + " AS source_kind "
            + selection_fields +
            "FROM articles a JOIN source_batches sb ON sb.batch_id = a.batch_id "
            + selection_join +
            "LEFT JOIN user_actions u ON u.target_type = 'article' "
            "AND u.target_id = a.article_id WHERE 1=1")
-    vals = []
     if selected:
         # 동일 URL이 여러 날짜에 다시 선정될 수 있으므로 날짜별 관계를 조회한다.
         if date:
             sql += " AND s.batch_date = ?"; vals.append(date)
     if source_kind:
-        sql += " AND sb.source_kind = ?"; vals.append(source_kind)
+        sql += f" AND {source_field} = ?"; vals.append(source_kind)
     if article_type:
-        sql += " AND a.article_type = ?"; vals.append(article_type)
+        sql += f" AND {display_field('article_type')} = ?"; vals.append(article_type)
     if edu_field:
-        sql += " AND a.edu_fields LIKE ?"; vals.append(f"%{edu_field}%")
+        sql += f" AND {display_field('edu_fields')} LIKE ?"; vals.append(f"%{edu_field}%")
     if q:
-        sql += " AND (a.title LIKE ? OR a.publisher LIKE ?)"
+        sql += f" AND ({display_field('title')} LIKE ? OR {display_field('publisher')} LIKE ?)"
         vals.extend([f"%{q}%", f"%{q}%"])
     if date and not selected:
-        sql += " AND a.batch_date = ?"; vals.append(date)
+        sql += " AND (a.batch_date = ? OR s.article_id IS NOT NULL)"; vals.append(date)
     if list_type:
-        sql += (" AND s.list_type = ?" if selected else " AND a.list_type = ?")
+        sql += (" AND COALESCE(s.list_type, a.list_type) = ?" if use_snapshot else " AND a.list_type = ?")
         vals.append(list_type)
     if publisher:
-        sql += " AND a.publisher LIKE ?"; vals.append(f"%{publisher}%")
+        sql += f" AND {display_field('publisher')} LIKE ?"; vals.append(f"%{publisher}%")
     if favorite:
         sql += " AND COALESCE(u.favorite, 0) = 1"
     if read_status:
         sql += " AND COALESCE(u.read_status, 'unread') = ?"; vals.append(read_status)
     if not include_excluded:
         sql += " AND COALESCE(u.excluded, 0) = 0"
-    sql += (" ORDER BY s.batch_date DESC, s.input_order" if selected
+    sql += (" ORDER BY COALESCE(s.batch_date, a.batch_date) DESC, COALESCE(s.input_order, a.input_order)" if use_snapshot
             else " ORDER BY a.batch_date DESC, a.input_order")
     # interest_only는 SQL 밖에서 거르므로 LIMIT을 먼저 걸면 관심 기사가 잘려 나간다 — 필터 후 절단
     if not interest_only:
@@ -950,6 +1100,14 @@ def search_articles(conn, q=None, date=None, list_type=None, publisher=None,
     rows = []
     for r in conn.execute(sql, vals).fetchall():
         d = dict(r)
+        if use_snapshot and d["selection_batch_date"] is not None:
+            for article_name in SELECTION_SNAPSHOT_FIELDS.values():
+                snapshot_value = d.pop("snapshot_" + article_name)
+                if snapshot_value is not None:
+                    d[article_name] = snapshot_value
+            d["batch_date"] = d["selection_batch_date"]
+            d["list_type"] = d["selection_list_type"]
+            d["input_order"] = d["selection_input_order"]
         d["interest_hits"] = match_interests(d["title"], keywords)
         rows.append(d)
     if interest_only:
@@ -994,19 +1152,22 @@ TYPE_ORDER = ["교육감", "정책·현안", "인터뷰·기획", "사업·성�
 def list_groups(conn, batch_date: str) -> list:
     """날짜별 그룹 목록 (대표기사·구성원 포함), 성격 우선순위 정렬."""
     groups = []
+    selected_articles = {r["article_id"]: r for r in search_articles(
+        conn, date=batch_date, selected=True, include_excluded=True, limit=-1)}
     for g in conn.execute(
             "SELECT g.*, COUNT(i.article_id) AS member_count FROM article_groups g "
             "JOIN article_group_items i ON i.group_id = g.group_id "
             "JOIN articles a ON a.article_id = g.representative_article_id "
             "WHERE g.batch_date = ? GROUP BY g.group_id", (batch_date,)).fetchall():
         d = dict(g)
-        d["members"] = [dict(r) for r in conn.execute(
-            "SELECT a.article_id, a.title, a.list_type, sb.source_kind, "
-            "COALESCE(NULLIF(a.publisher, ''), a.publisher_domain) AS publisher, "
-            "a.original_url FROM article_group_items i "
-            "JOIN articles a ON a.article_id = i.article_id "
-            "JOIN source_batches sb ON sb.batch_id = a.batch_id WHERE i.group_id = ? "
-            "ORDER BY a.published_at", (g["group_id"],)).fetchall()]
+        d["members"] = []
+        for row in conn.execute("SELECT article_id FROM article_group_items WHERE group_id = ?",
+                                (g["group_id"],)):
+            if row["article_id"] in selected_articles:
+                member = dict(selected_articles[row["article_id"]])
+                member["publisher"] = member["publisher"] or member["publisher_domain"]
+                d["members"].append(member)
+        d["members"].sort(key=lambda member: member["published_at"])
         groups.append(d)
     groups.sort(key=lambda g: (TYPE_ORDER.index(g["article_type"]) if g["article_type"] in TYPE_ORDER else 99,
                                -g["member_count"]))
@@ -1014,7 +1175,7 @@ def list_groups(conn, batch_date: str) -> list:
 
 
 def set_group_summary(conn, group_id: int, summary: str):
-    conn.execute("UPDATE article_groups SET summary = ?, updated_at = ? WHERE group_id = ?",
+    conn.execute("UPDATE article_groups SET summary = ?, summary_needs_review = 0, updated_at = ? WHERE group_id = ?",
                  (summary, _now(), group_id))
     conn.commit()
 
@@ -1225,6 +1386,7 @@ def build_digest_data(conn, batch_date: str) -> dict:
             "fields": [f for f in (g["category"] or "").split(",") if f],
             "member_count": g["member_count"],
             "summary": g["summary"],
+            "summary_needs_review": bool(g.get("summary_needs_review")),
             "representative": rep,
             "others": others,
         }
@@ -1283,6 +1445,8 @@ def digest_md(conn, batch_date: str) -> str:
             lines.append(f"- 관련 보도: {g['member_count']}건")
             if g["summary"]:
                 lines.append(f"- 요약: {g['summary']}")
+            elif g.get("summary_needs_review"):
+                lines.append("- 요약 상태: 구성 변경 · 요약 재검토 필요")
             lines.append(f"- 대표기사: {rep['title']} - {rep['publisher']}")
             lines.append(f"  {rep['original_url']}")
             if g["others"]:
@@ -1426,15 +1590,29 @@ def load_logo_datauri() -> str:
 
 
 def classify_backfill(conn) -> int:
-    """분류 누락 기사(기존 DB) 재분류."""
-    n = 0
-    for r in conn.execute("SELECT article_id, title FROM articles "
-                          "WHERE article_type = '' OR article_type IS NULL").fetchall():
+    """기사와 날짜별 스냅샷의 빈 분류만 각 제목 기준으로 보완한다."""
+    changed_ids = set()
+    for r in conn.execute("SELECT article_id, title, article_type, edu_fields FROM articles "
+                          "WHERE COALESCE(TRIM(article_type), '') = '' "
+                          "OR COALESCE(TRIM(edu_fields), '') = ''").fetchall():
         conn.execute("UPDATE articles SET article_type = ?, edu_fields = ? WHERE article_id = ?",
-                     (classify_type(r["title"]), ",".join(classify_fields(r["title"])), r["article_id"]))
-        n += 1
+                     (r["article_type"] if (r["article_type"] or "").strip() else classify_type(r["title"]),
+                      r["edu_fields"] if (r["edu_fields"] or "").strip() else ",".join(classify_fields(r["title"])),
+                      r["article_id"]))
+        changed_ids.add(r["article_id"])
+    for r in conn.execute(
+            "SELECT s.rowid AS selection_rowid, s.article_id, COALESCE(s.article_title, a.title) AS title, "
+            "s.article_type, s.edu_fields FROM article_selections s "
+            "JOIN articles a ON a.article_id = s.article_id "
+            "WHERE COALESCE(TRIM(s.article_type), '') = '' "
+            "OR COALESCE(TRIM(s.edu_fields), '') = ''").fetchall():
+        conn.execute("UPDATE article_selections SET article_type = ?, edu_fields = ? WHERE rowid = ?",
+                     (r["article_type"] if (r["article_type"] or "").strip() else classify_type(r["title"]),
+                      r["edu_fields"] if (r["edu_fields"] or "").strip() else ",".join(classify_fields(r["title"])),
+                      r["selection_rowid"]))
+        changed_ids.add(r["article_id"])
     conn.commit()
-    return n
+    return len(changed_ids)
 
 
 def export_csv_rows(rows) -> list:

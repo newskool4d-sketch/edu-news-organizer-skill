@@ -18,6 +18,13 @@ VERIFIED_METADATA = {
 }
 
 
+def minimal_public_html():
+    contract = publish_site.load_publication_contract()
+    css = "\n".join(contract["layout"]["required_css_tokens"])
+    return (f'<html><head><meta name="edu-news-mode" content="public"><style>{css}</style></head>'
+            f'<body>{contract["public_safety"]["required_marker"]}<main class="wrap"></main></body></html>')
+
+
 class TestPublicMode(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -79,7 +86,7 @@ class TestArchiveIndex(unittest.TestCase):
         self.assertIn('href="archive/2026-07-20.html"', html)
         self.assertIn("◀ 지난 호 (7. 20.)", html)
         self.assertIn("2026. 7. 21. (화)", html)
-        self.assertIn("다음 호 예정 · 매일 09:00", html)
+        self.assertIn("다음 호 준비 중", html)
         self.assertIn('href="archive/index.html"', html)
         self.assertIn("전체 지난 호", html)
 
@@ -115,7 +122,7 @@ class TestArchiveIndex(unittest.TestCase):
             )
 
     def test_build_refreshes_navigation_on_all_archived_pages(self):
-        digest = '<html><head><style></style></head><body><main class="wrap"></main></body></html>'
+        digest = minimal_public_html()
         with tempfile.TemporaryDirectory() as tmp:
             site = Path(tmp)
             archive = site / "archive"
@@ -217,7 +224,7 @@ class TestPublicationContract(unittest.TestCase):
         )
         css = "\n".join(contract["layout"]["required_css_tokens"])
         html = (
-            f'<html><head><style>{css}</style></head><body>'
+            f'<html><head><meta name="edu-news-mode" content="public"><style>{css}</style></head><body>'
             f'{contract["public_safety"]["required_marker"]}<main>{sections}</main></body></html>'
         )
         publish_site.validate_publication_contract(html, contract)
@@ -334,7 +341,7 @@ class TestPublicationContract(unittest.TestCase):
             '<a href="https://www.heraldk.com/article/2026081300230428560">기사</a>',
         )
 
-    def test_briefing_parity_uses_title_fallback_for_grouped_url(self):
+    def test_briefing_parity_requires_explicit_group_relationship(self):
         article = {
             "title": "인천교육감 선거 식사 제공·불법 선거운동 드러나",
             "original_url": "https://briefing.example/original",
@@ -342,6 +349,7 @@ class TestPublicationContract(unittest.TestCase):
         publish_site.validate_briefing_published_content_parity(
             [article],
             '<a href="https://other.example/representative">인천교육감 선거 식사 제공 불법 선거운동</a>',
+            represented_by={article["original_url"]: "https://other.example/representative"},
         )
 
     def test_briefing_parity_accepts_html_escaped_query_url(self):
@@ -455,24 +463,47 @@ class TestPublicationContract(unittest.TestCase):
 
 
 class TestGitPush(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.site = Path(self.tmp.name)
+        publish_site.build(self.site)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _mock_output(self, command, **kwargs):
+        if command[1:] == ["rev-parse", "--show-toplevel"]:
+            stdout = str(self.site)
+        elif command[1] == "symbolic-ref":
+            stdout = "main\n"
+        elif command[1:3] == ["rev-parse", "--abbrev-ref"]:
+            stdout = "origin/main\n"
+        elif command[1:3] == ["diff", "--cached"]:
+            stdout = "archive/index.html\0" if getattr(self, "added", False) else ""
+        else:
+            stdout = ""
+            if command[1] == "add":
+                self.added = True
+        return mock.Mock(returncode=0, stdout=stdout, stderr="")
+
     @mock.patch("publish_site.subprocess.run")
     def test_git_push_uses_iso_date_in_commit_message(self, run):
-        run.return_value = mock.Mock(returncode=0, stdout="", stderr="")
-        publish_site.git_push(Path("site"), "2026-07-21")
+        run.side_effect = self._mock_output
+        publish_site.git_push(self.site, "2026-07-21")
         commands = [call.args[0] for call in run.call_args_list]
-        self.assertEqual(commands[1], ["git", "commit", "-m", "다이제스트 갱신: 2026-07-21"])
-        self.assertEqual(commands[2], ["git", "push"])
+        self.assertIn(["git", "commit", "-m", "다이제스트 갱신: 2026-07-21"], commands)
+        self.assertIn(["git", "push", "--", "origin", "HEAD:refs/heads/main"], commands)
 
     @mock.patch("publish_site.subprocess.run")
     def test_git_push_surfaces_command_failure(self, run):
         run.return_value = mock.Mock(returncode=1, stdout="", stderr="authentication failed")
         with self.assertRaisesRegex(RuntimeError, "authentication failed"):
-            publish_site.git_push(Path("site"), "2026-07-21")
+            publish_site.git_push(self.site, "2026-07-21")
 
     @mock.patch("publish_site.subprocess.run")
     def test_git_push_decodes_windows_git_output_as_utf8_safely(self, run):
-        run.return_value = mock.Mock(returncode=0, stdout="", stderr="")
-        publish_site.git_push(Path("site"), "2026-07-21")
+        run.side_effect = self._mock_output
+        publish_site.git_push(self.site, "2026-07-21")
         for call in run.call_args_list:
             self.assertEqual(call.kwargs["encoding"], "utf-8")
             self.assertEqual(call.kwargs["errors"], "replace")

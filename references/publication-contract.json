@@ -82,11 +82,17 @@
   ],
   "public_safety": {
     "required_marker": "비공식 · 개인 정리용",
+    "required_mode": "public",
     "forbidden_text": [
       "내 관심업무"
     ]
   },
   "revisions": [
+    {
+      "date": "2026-11-04",
+      "approved_by": "user",
+      "change": "기능 오류 7건 및 디자인 개선 승인. 신규·재인덱스 공개 검증, 명시 산출물 배포, 실패 복구, 날짜별 정정·수동 요약 보존. 공개 모드 마커와 manifest 적용. 텍스트 대비·크기·관련기사 링크·통계·시각 표기 개선. 4/2/1열·섹션·유형 순서는 유지."
+    },
     {
       "date": "2026-10-02",
       "approved_by": "user",

@@ -65,6 +65,11 @@ python scripts/publish_site.py --site-dir <site폴더> --date 2026-07-16 --push 
 입력 순서·후보 게시 경계·데이터가 있는 최대 3단 섹션의 순서·반응형 열·기사 유형 순서가 이 JSON과 다르면
 `publish_site.py`가 생성을 중단한다. JSON 또는 템플릿 변경은 사용자 명시 승인 없이는 금지한다.
 
+게시 파일은 `publication-manifest.json`의 생성 목록·해시로 검증하며, 재인덱스도 공개 안전 검사를 거친다.
+구형 보관본은 [명시 이관 절차](./references/deploy-vercel.md#구형-공개본-이관)를 사용한다.
+`--adopt-legacy-public --dry-run`은 읽기 전용 후보 검사이며, 실제 적용은 검토한 파일과 해시를 대조한 뒤
+manifest만 생성한다. 모드 표식을 수동 삽입하거나 안전 검사를 우회하지 않는다.
+
 - DB 위치: `%USERPROFILE%\Documents\Codex\EduNewsOrganizer\news.db` (환경변수 `EDU_NEWS_DB_PATH` 또는 `--db`로 변경)
 - 원본 목록(raw_text)은 source_batches에 그대로 보존한다 (기본 원칙: 원본 보존)
 - 상류 JSON의 `relevance_hint`·판정 근거·위치/교육주체/학생활동 히트는 기사 단위로 보존한다. 후보 자체는 삭제하지 않는다. 공개 묶음·다이제스트에는 브리핑 명시 기사와 본문 검증 완료(`publication_eligible`) 후보만 사용한다(2026-10-02 복원). `relevance_hint`는 triage 메타데이터일 뿐 게시 권한이 아니다. 하단 "타 시도·일반 교육 동향"만 예외로, 비인천·교육 주제 후보를 참고용으로 30건까지 싣는다(`build_reference_candidates`).
