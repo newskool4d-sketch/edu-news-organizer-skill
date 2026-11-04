@@ -1490,22 +1490,30 @@ def digest_md(conn, batch_date: str) -> str:
 PUBLIC_HERO_SINGLETON_LIMIT = 10
 
 
+def public_hero_card_limit(total: int) -> int:
+    """공개 기사 수(묶음 카드 + 브리핑 단독 기사)에 따른 핵심 카드 상한.
+
+    10건 이하인 날은 절반(최소 1)만 카드로 두어 유형별 "전체 기사" 목록이 남게 한다.
+    11건 이상은 기존과 같이 PUBLIC_HERO_SINGLETON_LIMIT. (2026-11-04 사용자 승인)
+    """
+    if total > PUBLIC_HERO_SINGLETON_LIMIT:
+        return PUBLIC_HERO_SINGLETON_LIMIT
+    return max(1, total // 2)
+
+
 def _public_singleton_issue_fallback(data: dict) -> dict:
     """공개본에서 명시 브리핑 단독 기사 일부를 핵심 카드로 올린다.
 
     2026-10-02부터 공개본은 본문 검증 통과 기사만 싣고 상류가 사안당 대표 1건만 남기므로
     동일 사안 묶음이 거의 생기지 않는다. 이전 폴백은 묶음이 없으면 브리핑 기사 전부를
     카드로 올려 유형별 "전체 기사" 목록이 사라졌다. 이제는 묶음 카드 + 브리핑 단독 기사를
-    합쳐 PUBLIC_HERO_SINGLETON_LIMIT건까지만 카드로 두고, 나머지는 유형별 목록에 남긴다.
+    합쳐 public_hero_card_limit()건까지만 카드로 두고, 나머지는 유형별 목록에 남긴다.
 
     교육감 기사 최우선(사용자 상위 지침, TYPE_ORDER 첫 자리): 교육감 유형 단독 기사는 보고서
     위치와 무관하게 먼저 카드 자리를 받고, 카드 정렬에서도 맨 앞에 놓는다. 그 외 단독 기사는
     보고서(입력) 순서를 유지한다.
     """
     hero = list(data.get("hero_issues") or [])
-    slots = PUBLIC_HERO_SINGLETON_LIMIT - len(hero)
-    if slots <= 0:
-        return data
 
     def _order(article):
         value = article.get("selection_input_order", article.get("input_order"))
@@ -1523,6 +1531,9 @@ def _public_singleton_issue_fallback(data: dict) -> dict:
             if article.get("source_kind") in DIGEST_SOURCE_PRIORITY:
                 candidates.append((_order(article), _type_of(article, article_type), article))
     if not candidates:
+        return data
+    slots = public_hero_card_limit(len(hero) + len(candidates)) - len(hero)
+    if slots <= 0:
         return data
     candidates.sort(key=lambda c: (0 if c[1] == TYPE_ORDER[0] else 1, c[0]))
 

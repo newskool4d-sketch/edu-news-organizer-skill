@@ -317,8 +317,32 @@ class TestPublicationContract(unittest.TestCase):
         }
         data["all_by_type"] = [("기타", [single])]
         public = newsdb._public_singleton_issue_fallback(data)
-        self.assertEqual([g["member_count"] for g in public["hero_issues"]], [2, 1])
-        self.assertEqual(public["all_by_type"], [])
+        # 공개 기사 2건(묶음 1 + 단독 1) → 카드 상한 1: 묶음이 자리를 차지하고 단독은 목록에 남는다.
+        self.assertEqual([g["member_count"] for g in public["hero_issues"]], [2])
+        self.assertEqual([a["article_id"] for _, rows in public["all_by_type"] for a in rows], [7])
+
+    def test_public_small_day_keeps_all_articles_section(self):
+        data = self._sparse_public_data("empty")
+        items = [{
+            "article_id": 400 + i, "title": f"브리핑 기사 {i}", "publisher": "예시매체",
+            "original_url": f"https://example.com/s{i}", "source_kind": "briefing-md",
+            "article_type": "사업·성과", "selection_input_order": i + 1,
+        } for i in range(9)]
+        data["all_by_type"] = [("사업·성과", items)]
+        data["meta"]["total"] = 9
+        public = newsdb._public_singleton_issue_fallback(data)
+        self.assertEqual(len(public["hero_issues"]), 4)
+        remaining = [a["selection_input_order"] for _, rows in public["all_by_type"] for a in rows]
+        self.assertEqual(remaining, [5, 6, 7, 8, 9])
+        html = newsdb.render_digest_html(data, public=True)
+        self.assertEqual(html.count('class="hero-card"'), 4)
+        self.assertIn("전체 기사", html)
+
+    def test_public_hero_card_limit_boundaries(self):
+        self.assertEqual(
+            [newsdb.public_hero_card_limit(n) for n in (1, 2, 3, 9, 10, 11, 30)],
+            [1, 1, 1, 4, 5, 10, 10],
+        )
 
     def test_validator_blocks_missing_or_reordered_sections(self):
         contract = publish_site.load_publication_contract()
